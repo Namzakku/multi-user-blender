@@ -1,0 +1,39 @@
+--- a/replication/porcelain.py	2026-10-29 03:24:24.498524705 +0000
++++ b/replication/porcelain.py	2026-10-29 03:24:24.507706739 +0000
+@@ -4,6 +4,7 @@
+ 
+ from . import net
+ from .constants import ADDED, COMMITED, FETCHED, RP_COMMON, UP
++from . import merge3 as _merge3  # patched: three-way merge
+ from .exception import (
+     NonAuthorizedOperationError,
+     UnsupportedTypeError,
+@@ -114,8 +115,19 @@
+                 except AttributeError:
+                     logging.warning(f"Can stamp uuid on {type(node.instance)}")
+         try:
+-            repository.rdp.load(node.data, node.instance)
++            was_fetched = node.state == FETCHED  # patched: three-way merge
++            to_load, contributed = (_merge3.merge_fetched(repository, node)
++                                    if was_fetched else (node.data, False))
++            repository.rdp.load(to_load, node.instance)
+             node.state = UP
++            _merge3.remember(node.uuid, node.data)
++            if contributed:
++                try:
++                    repository.assert_modification_rights(node.uuid)
++                    commit(repository, node.uuid)
++                    push(repository, "origin", node.uuid)
++                except Exception as e:
++                    logging.info(f"merge3: could not publish merge of {node.uuid}: {e}")
+         except ReferenceError:
+             logging.error(f"Apply reference error")
+             node.instance = repository.rdp.resolve(node.data)
+@@ -197,6 +209,7 @@
+                 else:
+                     node.data = new_version
+                 node.state = COMMITED
++                _merge3.remember(node.uuid, node.data)  # patched: three-way merge
+                 logging.debug(f"Committed {node.uuid}")
+             else:
+                 logging.debug(f"Nothing to commit on node {node.uuid}")

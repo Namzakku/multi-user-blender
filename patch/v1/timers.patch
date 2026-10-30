@@ -1,0 +1,12 @@
+--- a/multi_user/timers.py	2026-10-29 03:32:07.690196324 +0000
++++ b/multi_user/timers.py	2026-10-29 03:32:21.537679880 +0000
+@@ -193,6 +193,9 @@
+ 
+     def execute(self):
+         settings = utils.get_preferences()
++        from replication import merge3 as _merge3  # patched: free editing
++        if getattr(_merge3, "FREE_EDIT", False):
++            return
+ 
+         if session and session.state == STATE_ACTIVE:
+             # Find user

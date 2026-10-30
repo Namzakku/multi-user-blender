@@ -1,0 +1,56 @@
+--- a/replication/interface.py
++++ b/replication/interface.py
+@@ -451,29 +451,32 @@
+             if type(command) in [Delete, Right]:
+                 command.execute(self.repository.object_store)
+ 
+-        # DATA IN
+-        try:
+-            data_result = self.repository.fetch(self.remote.data)
+-        except Exception as e:
+-            logging.error(f"Corrupted frame received, skipping it. Cause:{e}")
+-            traceback.print_exc()
+-            data_result = None
++        # DATA IN  (patched: drain every complete message, not one per tick)
++        for _drain in range(256):
++            try:
++                data_result = self.repository.fetch(self.remote.data)
++            except Exception as e:
++                logging.error(f"Corrupted frame received, skipping it. Cause:{e}")
++                traceback.print_exc()
++                data_result = None
+ 
+-        if data_result is not None:
+-            identity, update = data_result
+-            # Client snapshot
+-            if self._state == STATE_SYNCING:
+-                # If the snapshot is expected in the snapshot catalog we store
+-                logging.info("Snapshot: Adding an update for the late one...")
+-                self._snapshot_late_updates.put(update)
++            if data_result is None:
++                break
++            if data_result is not None:
++                identity, update = data_result
++                # Client snapshot
++                if self._state == STATE_SYNCING:
++                    # If the snapshot is expected in the snapshot catalog we store
++                    logging.info("Snapshot: Adding an update for the late one...")
++                    self._snapshot_late_updates.put(update)
+ 
+-            # Store received updates
+-            if self._state == STATE_ACTIVE:
+-                self.repository.do_commit(update)
+-                # TODO: remove with stateless refactor
+-                node_id = getattr(update, "uuid", getattr(update, "node_id", None))
+-                node = self.repository.graph.get(node_id)
+-                node.state = FETCHED
++                # Store received updates
++                if self._state == STATE_ACTIVE:
++                    self.repository.do_commit(update)
++                    # TODO: remove with stateless refactor
++                    node_id = getattr(update, "uuid", getattr(update, "node_id", None))
++                    node = self.repository.graph.get(node_id)
++                    node.state = FETCHED
+         # Various timeout checks
+         # auth
+         if self._state == STATE_AUTH:
