@@ -34,6 +34,11 @@ Results, Space B, three clients, `A_head` (482 vertices, 512 faces, with a UV ma
 
 | GUI, two AI agents in Spaces A (host) and C, hand edits on `Shared_box`, a cube with a 4 by 4 grid per side (98 vertices, 96 faces). A extrudes a top center quad by 0.3. C, in one Edit Mode session, Knife-cuts a +X center quad and insets a -Y center quad by 0.1 | Pass. C was in Edit Mode while A's extrude arrived, so C's edits were made without it. Both Spaces ended at 108 vertices and 105 faces, the count with all three edits kept, with the same id hash, zmax 0.8 and no conflicts |
 
+| ops on the real head: a copy of `pdf-sample-book-ear-rebuild-2026-10-28.blend`, object `Circle.002` (325 vertices, 318 faces, Mirror modifier with clipping, UV map). Two clients in Space A, one in the ear region, one around the eye socket. Each runs three Edit Mode sessions of 4 s that overlap the other's: loop cut (`loopcut_slide` on an edge ring inside its region), connect vertex path across a quad, merge at center of an edge | Pass. Loop cuts of 13 and 15 faces, two connects, two merges, all present on both clients: 351 vertices and 345 faces, the count with all six edits. Same id hash and UV hash, no conflicts |
+| ops on `A_head` | Connect and merge synced and both clients converged. No loop cut ran: `A_head` is closed, so every edge ring wraps around the head and leaves either region |
+
+Hosting a .blend that was saved in Edit Mode fails in upstream Multi-User: server init cannot dump a mesh in Edit Mode and the session ends. The harness switches to Object Mode before hosting. Do the same when hosting by hand.
+
 v3 is installed in Spaces A, B and C. A three-agent GUI run on v3 was started on 2026-10-31 but stopped before it could be checked.
 
 The first topo run failed: every client numbered the mesh on its own, and those numberings counted as conflicting commits, so about 2,000 elements were hidden for a while and one edit was lost. The first numbering is now a shared baseline built from the synced mesh, which cannot conflict.
@@ -45,7 +50,7 @@ v3 limits, in addition to v2's:
 - The table keeps tombstones and commit records for the whole session. It is never pruned.
 - Client numbers come from a hash of the username into 255 values, so two users can collide. Not detected.
 - The first edit on a client before any ids were loaded maps vertices by index, which is right when Blender appended the new vertices. After a deletion it falls back to matching positions.
-- Knife, connect-vertex-path and interactive loop cut have not been run through the harness. A three-agent GUI run has not been done on v3.
+- Loop cut, connect vertex path, merge and Knife have each been run on v3 (loop cut, connect and merge scripted through the real operators, Knife by a GUI agent). A loop cut whose ring leaves your region will touch other users' regions and can conflict. A three-agent GUI run has not been completed on v3.
 
 ## Files (in `patch/v2/`)
 

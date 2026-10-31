@@ -12,7 +12,7 @@ OUT = os.environ["OUT"]
 PORT = int(os.environ.get("PORT", 5600))
 NAME = f"agent{IDX}"
 PKG = "bl_ext.blender_org.multi_user"
-OBJ = "A_head"
+OBJ = os.environ.get("OBJ", "A_head")
 rng = random.Random(1000 + IDX)
 
 events = []           # what this client did
@@ -33,7 +33,8 @@ def flush(name, data):
 def ctx():
     win = bpy.context.window_manager.windows[0]
     area = next(a for a in win.screen.areas if a.type == "VIEW_3D")
-    return bpy.context.temp_override(window=win, area=area)
+    region = next(r for r in area.regions if r.type == "WINDOW")
+    return bpy.context.temp_override(window=win, area=area, region=region)
 
 
 def prefs():
@@ -50,6 +51,10 @@ def start():
     prefs()
     with ctx():
         if ROLE == "host":
+            # Multi-User cannot host a mesh in Edit Mode (server init fails), and a
+            # .blend saved in Edit Mode opens in it
+            if bpy.context.object and bpy.context.object.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
             for o in list(bpy.data.objects):
                 if o.name != OBJ:
                     bpy.data.objects.remove(o, do_unlink=True)
@@ -251,6 +256,151 @@ def schedule_topoclash():
     bpy.app.timers.register(run, first_interval=max(0.0, T0 + at - time.time()))
 
 
+REGION_BOXES = {
+    # normalized bounding-box ranges (x, y, z); front is -Y, the half mesh is x >= 0
+    "ear": ((0.7, 1.0), (0.35, 0.8), (0.2, 0.8)),
+    "eye": ((0.15, 0.75), (0.0, 0.3), (0.25, 0.6)),
+}
+REGIONS = os.environ.get("REGIONS", "ear,eye").split(",")
+_bbox = {}
+
+
+def in_region(co):
+    box = REGION_BOXES[REGIONS[IDX % len(REGIONS)]]
+    lo, hi = _bbox["lo"], _bbox["hi"]
+    for k in range(3):
+        n = (co[k] - lo[k]) / max(hi[k] - lo[k], 1e-9)
+        if not box[k][0] <= n <= box[k][1]:
+            return False
+    return True
+
+
+def _ring(bm_edge):
+    """Faces a loop cut through this edge would cross: walk the quad ring both ways."""
+    faces, open_ends = [], 0
+    for start in bm_edge.link_loops:
+        loop, seen = start, 0
+        while True:
+            f = loop.face
+            if len(f.verts) != 4 or f in faces:
+                if len(f.verts) != 4:
+                    open_ends += 1
+                break
+            faces.append(f)
+            nxt = loop.link_loop_next.link_loop_next.link_loop_radial_next
+            if nxt == loop.link_loop_next.link_loop_next:  # boundary edge
+                open_ends += 1
+                break
+            loop = nxt
+            seen += 1
+            if seen > 500:
+                break
+    return faces
+
+
+def _edit_session(op):
+    """Enter Edit Mode now, do the op 4 s later, leave Edit Mode, so sessions of
+    the two clients overlap the way two people's do."""
+    def enter():
+        o = bpy.data.objects[OBJ]
+        for x in bpy.context.view_layer.objects:
+            x.select_set(False)
+        o.select_set(True)
+        bpy.context.view_layer.objects.active = o
+        with ctx():
+            bpy.ops.object.mode_set(mode="EDIT")
+        bpy.app.timers.register(do, first_interval=4.0)
+        return None
+
+    def do():
+        import bmesh
+        o = bpy.data.objects[OBJ]
+        before = _counts()
+        try:
+            with ctx():
+                bm = bmesh.from_edit_mesh(o.data)
+                bpy.ops.mesh.select_all(action="DESELECT")
+                note = op(o, bm)
+            after = _counts()
+            d = [op.__name__, after[0] - before[0], after[1] - before[1], note]
+        except Exception as e:
+            state["errors"] += 1
+            d = [op.__name__, 0, 0, f"error {e!r}"]
+        with ctx():
+            bpy.ops.object.mode_set(mode="OBJECT")
+        topo_log.append(d)
+        state["edits"] += 1
+        log(f"ops {d}")
+        return None
+    return enter
+
+
+def loopcut(o, bm):
+    import bmesh
+    bm.edges.ensure_lookup_table()
+    for e in bm.edges:
+        faces = _ring(e)
+        if len(faces) >= 2 and all(in_region(v.co) for f in faces for v in f.verts):
+            index = e.index
+            with ctx():
+                r = bpy.ops.mesh.loopcut_slide(
+                    MESH_OT_loopcut={"number_cuts": 1, "edge_index": index, "object_index": 0},
+                    TRANSFORM_OT_edge_slide={"value": 0.0})
+            return f"edge {index} ring {len(faces)} {r}"
+    return "no ring inside region"
+
+
+def connect(o, bm):
+    import bmesh
+    for f in bm.faces:
+        if len(f.verts) == 4 and all(in_region(v.co) for v in f.verts) \
+                and all(abs(v.co.x) > 1e-4 for v in f.verts):
+            a, b = f.verts[0], f.verts[2]
+            a.select_set(True)
+            b.select_set(True)
+            bm.select_history.clear()
+            bm.select_history.add(a)
+            bm.select_history.add(b)
+            bmesh.update_edit_mesh(o.data)
+            with ctx():
+                r = bpy.ops.mesh.vert_connect_path()
+            return f"face {f.index} {r}"
+    return "no quad inside region"
+
+
+def merge(o, bm):
+    import bmesh
+    for e in bm.edges:
+        a, b = e.verts
+        if in_region(a.co) and in_region(b.co) and abs(a.co.x) > 1e-4 and abs(b.co.x) > 1e-4 \
+                and all(in_region(v.co) for f in e.link_faces for v in f.verts):
+            a.select_set(True)
+            b.select_set(True)
+            index = e.index  # the merge removes this edge
+            bmesh.update_edit_mesh(o.data)
+            with ctx():
+                r = bpy.ops.mesh.merge(type="CENTER")
+            return f"edge {index} {r}"
+    return "no edge inside region"
+
+
+def schedule_ops():
+    def setup():
+        o = bpy.data.objects.get(OBJ)
+        if o is None or not state["connected"]:
+            return 1.0
+        co = [v.co for v in o.data.vertices]
+        _bbox["lo"] = [min(c[k] for c in co) for k in range(3)]
+        _bbox["hi"] = [max(c[k] for c in co) for k in range(3)]
+        log(f"ops region {REGIONS[IDX % len(REGIONS)]} bbox {_bbox}")
+        return None
+    bpy.app.timers.register(setup, first_interval=max(0.5, T0 - 5 - time.time()))
+    offset = 3.0 * IDX
+    for k, op in enumerate((loopcut, connect, merge)):
+        bpy.app.timers.register(_edit_session(op),
+                                first_interval=max(1.0, T0 + offset + 12 * k - time.time()))
+
+
 def tick():
     now = time.time()
     if now >= T0 + DUR:
@@ -258,7 +408,7 @@ def tick():
         return None
     if not state["connected"] or bpy.data.objects.get(OBJ) is None:
         return 0.5
-    if SCEN in ("conflict", "stale", "topoclash"):
+    if SCEN in ("conflict", "stale", "topoclash", "ops"):
         return None   # timed writes are scheduled separately
     if SCEN == "topo":
         try:
@@ -467,6 +617,8 @@ if SCEN == "stale":
     schedule_stale()
 if SCEN == "topoclash":
     schedule_topoclash()
+if SCEN == "ops":
+    schedule_ops()
 
 join_at = 3 if ROLE == "host" else 10 + 2 * IDX
 bpy.app.timers.register(start, first_interval=join_at)
