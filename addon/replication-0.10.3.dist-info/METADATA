@@ -1,0 +1,30 @@
+Metadata-Version: 2.4
+Name: replication
+Version: 0.10.3
+Summary: A prototype object replication lib
+Author-email: Swann Martinez <swann.martinez@pm.me>
+License: GPL-3.0-or-later
+Project-URL: Homepage, https://gitlab.com/slumber/replication
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: deepdiff==8.1.1
+Dynamic: license-file
+
+# A basic python replication framework prototype
+
+> A simple client/server python objects replication framework 
+
+## Dependencies
+
+| Dependencies | Version | Needed |
+|--------------|:-------:|-------:|
+| ZeroMQ       | latest  |    yes |
+
+## Contributing
+
+1. Fork it (<https://gitlab.com/yourname/yourproject/fork>)
+2. Create your feature branch (`git checkout -b feature/fooBar`)
+3. Commit your changes (`git commit -am 'Add some fooBar'`)
+4. Push to the branch (`git push origin feature/fooBar`)
+5. Create a new Pull Request
