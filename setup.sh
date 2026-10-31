@@ -44,7 +44,7 @@ test -f "$SITE/replication/topo3.py" || { echo "patched replication missing in $
 
 echo "== test scripts"
 mkdir -p "$UHOME/mu" "$UHOME/stress"
-cp "$HERE/patch/v3/gui_session.py" "$HERE/tests/live_session.py" "$UHOME/mu/"
+cp "$HERE/patch/v3/gui_session.py" "$HERE/tests/live_session.py" "$HERE/tests/mesh_ops.py" "$HERE/tests/expected_meshes.py" "$UHOME/mu/"
 cp "$HERE/patch/v3/stress.py" "$HERE/patch/v3/run.sh" "$HERE/patch/v3/check.py" \
    "$HERE/patch/v3/check_topo.py" "$HERE/patch/v3/owners.py" "$UHOME/stress/"
 chown -R "$U:$U" "$UHOME/mu" "$UHOME/stress"

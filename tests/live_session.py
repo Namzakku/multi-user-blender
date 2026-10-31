@@ -4,8 +4,9 @@ ROLE=host|client NAME=<user> IP=<host ip> T0=<shared epoch seconds>
     blender --python live_session.py
 
 Both run the same schedule on the shared clock T0:
-  +50   both edit the centre of the box top at once (host pokes, client insets),
-        a conflict: each Blender should show a notice naming the other user
+  +50   both edit the centre of the box top at once (host HOST_OP, default
+        poke; client CLIENT_OP, default inset; see mesh_ops.OPS), a conflict:
+        each Blender should show a notice naming the other user
   +90   the host deletes the object "Doomed"; it should vanish on the client
   +200  the client edits the +x side, after it has seen the host's edit
   +330  the host edits the bottom; the settled commits should be pruned
@@ -19,8 +20,12 @@ import json
 import os
 import time
 
-import bmesh
+import sys
+
 import bpy
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mesh_ops  # noqa: E402
 
 ROLE, NAME = os.environ["ROLE"], os.environ["NAME"]
 IP = os.environ.get("IP", "127.0.0.1")
@@ -74,23 +79,16 @@ def start():
         at(330, lambda: edit(lambda f: f.calc_center_median().z < -0.49, "poke"))
     else:
         at(200, lambda: edit(lambda f: f.calc_center_median().x > 0.49, "poke"))
-    centre = lambda f: f.calc_center_median().z > 0.49 and max(abs(f.calc_center_median().x),
-                                                               abs(f.calc_center_median().y)) < 0.26
+    op = os.environ.get("HOST_OP", "poke") if ROLE == "host" else os.environ.get("CLIENT_OP", "inset")
     at(50 + float(os.environ.get("HOST_DELAY", "0")) * (ROLE == "host"),
-       lambda: edit(centre, "poke" if ROLE == "host" else "inset"))
+       lambda: edit(mesh_ops.in_centre, op))
     bpy.app.timers.register(status, first_interval=5)
     return None
 
 
 def make_objects():
     with ctx():
-        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 1.0))
-        bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="SELECT")
-        bpy.ops.mesh.subdivide(number_cuts=3)
-        bpy.ops.mesh.select_all(action="DESELECT")
-        bpy.ops.object.mode_set(mode="OBJECT")
-        bpy.context.active_object.name = "Shared_box"
+        mesh_ops.make_box("Shared_box")
         bpy.ops.mesh.primitive_cube_add(size=0.5, location=(2, 0, 1.0))
         bpy.context.active_object.name = "Doomed"
     note({"made": ["Shared_box", "Doomed"]})
@@ -111,25 +109,8 @@ def edit(pick, op):
         note({"edit_skipped": "no Shared_box"})
         return None
     with ctx():
-        for x in bpy.context.view_layer.objects:
-            x.select_set(False)
-        o.select_set(True)
-        bpy.context.view_layer.objects.active = o
-        bpy.ops.object.mode_set(mode="EDIT")
-        bm = bmesh.from_edit_mesh(o.data)
-        for f in bm.faces:
-            f.select_set(False)
-        chosen = [f for f in bm.faces if pick(f)]
-        for f in chosen:
-            f.select_set(True)
-        bmesh.update_edit_mesh(o.data)
-        if op == "poke":
-            r = bpy.ops.mesh.poke()
-        else:
-            r = bpy.ops.mesh.inset(thickness=0.05)
-        bpy.ops.object.mode_set(mode="OBJECT")
-        o.select_set(False)
-    note({"edit": op, "faces": len(chosen), "result": str(r)})
+        chosen, r = mesh_ops.edit(o, op, pick)
+    note({"edit": op, "faces": chosen, "result": str(r)})
     return None
 
 
