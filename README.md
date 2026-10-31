@@ -2,6 +2,8 @@
 
 A test patch for the Blender Multi-User extension 0.8.2 (replication 0.10.3, Blender 5.2.2). It lets several users edit the same object at the same time. Each value goes to whoever wrote it last, and no one's edit silently overwrites someone else's. Tested 2026-10-29 and 2026-10-30 in cua Space `local:blender-agent-b`, with up to three Blender instances driven by a stress script.
 
+To build a Space with all of this from scratch, see [SETUP.md](SETUP.md) and run `setup.sh`.
+
 `patch/v3/` is the current version. It is v2 plus merging of concurrent topology edits on one mesh, see "v3: topology merge" below. `patch/v2/` is the per-value merge without it. `patch/v1/` is the earlier three-way merge, kept for reference. It loses edits with three clients.
 
 ## v3: topology merge (2026-10-31)
