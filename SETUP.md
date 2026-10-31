@@ -66,6 +66,12 @@ docker exec -u cua -e HOME=/home/cua -e SETTLE=40 <container> sh /home/cua/stres
 docker exec -u cua <container> sh -c 'cd /home/cua/stress && python3 check_topo.py out_topo_3'
 ```
 
-Expect `CONVERGED mesh by id: True` and `ALL EDITS PRESENT: True`.
+Expect `CONVERGED mesh by id: True` and `ALL EDITS PRESENT: True`. The topo scenario needs `two_agent_build.blend` with an `A_head` mesh in `~/stress/`, which is not in the repo. Without it, use `BLEND=<file> OBJ=<mesh object>` with the `ops` scenario.
 
-For conflict notices, deletion and pruning, run `~/mu/live_session.py` in two Spaces with the same `T0` (a Unix time about 20 s ahead), `ROLE=host NAME=alice` in one and `ROLE=client NAME=bob IP=<host ip>` in the other, the same way as `gui_session.py` above. It takes about 6 minutes and logs to `/tmp/live_<NAME>.log`. Its docstring lists what to expect at each step. The topo scenario needs `two_agent_build.blend` with an `A_head` mesh in `~/stress/`, which is not in the repo. Without it, use `BLEND=<file> OBJ=<mesh object>` with the `ops` scenario (see README.md).
+For same-region clashes between two Spaces, run from the Docker host (Git Bash):
+
+```sh
+sh tests/live_trials.sh <host space> <client space> 5 0 bevel extrude
+```
+
+It restarts both Blenders per trial and stops at the first wrong or diverged mesh. For conflict notices, deletion and pruning, run `~/mu/live_session.py` in two Spaces with the same `T0` (a Unix time about 20 s ahead), `ROLE=host NAME=alice` in one and `ROLE=client NAME=bob IP=<host ip>` in the other, the same way as `gui_session.py` above. It takes about 6 minutes and logs to `/tmp/live_<NAME>.log`. Its docstring lists what to expect at each step.
