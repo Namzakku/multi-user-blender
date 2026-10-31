@@ -11,7 +11,7 @@ T0, DUR, SCEN = float(os.environ["T0"]), float(os.environ["DUR"]), os.environ["S
 OUT = os.environ["OUT"]
 PORT = int(os.environ.get("PORT", 5600))
 NAME = f"agent{IDX}"
-PKG = "bl_ext.blender_org.multi_user"
+PKG = next((a for a in bpy.context.preferences.addons.keys() if a.endswith(".multi_user")), "bl_ext.blender_org.multi_user")
 OBJ = os.environ.get("OBJ", "A_head")
 rng = random.Random(1000 + IDX)
 

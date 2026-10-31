@@ -5,8 +5,7 @@ How to build a cua Space that runs Blender with the patched Multi-User add-on (v
 ## What you get
 
 - Blender 5.2.2 in `/opt/blender`, on the path as `blender`
-- Multi-User 0.8.2 from extensions.blender.org, enabled for the user `cua`
-- The v2 patches and v3 on top: per-value merging, and topology merging by permanent vertex id (see [README.md](README.md))
+- The patched Multi-User from `addon/` (upstream 0.8.2 with the v2 and v3 patches applied), built by `build.py` and installed for the user `cua` as `multi_user 0.8.2+mu3`: per-value merging, and topology merging by permanent vertex id (see [README.md](README.md))
 - `~/mu/gui_session.py` to host or join a session, and `~/stress/` with the stress harness
 
 ## 1. Create the Space
@@ -25,13 +24,13 @@ Copy this folder into the Space and run `setup.sh` as root. From the Windows hos
 
 ```sh
 export MSYS_NO_PATHCONV=1
-docker cp "E:/SoloDevs/KaikeiGame/tools/multiuser-merge-patch" blender-agent-x:/tmp/mu-patch
+docker cp "<path to this repository>" blender-agent-x:/tmp/mu-patch
 docker exec -u root blender-agent-x sh /tmp/mu-patch/setup.sh
 ```
 
-It takes a few minutes, mostly the Blender download. It ends by printing two `MU_CHECK` lines: Multi-User enabled, and `merge3 True topo3 True`. Running it again skips what is done.
+It takes a few minutes, mostly the Blender download. It ends by printing two `MU_CHECK` lines: Multi-User enabled, and `merge3 True topo3 True`. Nothing is downloaded from extensions.blender.org, so a newer upstream release does not affect it.
 
-The script stops if extensions.blender.org serves a Multi-User version other than 0.8.2, because the patches are written against 0.8.2.
+The script stops if the upstream Multi-User is already installed in the Space, and prints the command that removes it.
 
 ## 3. Start a session
 

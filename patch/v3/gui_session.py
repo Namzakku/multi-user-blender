@@ -5,7 +5,7 @@ import os, hashlib, json, bpy
 
 ROLE, NAME = os.environ["ROLE"], os.environ["NAME"]
 IP = os.environ.get("IP", "127.0.0.1")
-PKG = "bl_ext.blender_org.multi_user"
+PKG = next((a for a in bpy.context.preferences.addons.keys() if a.endswith(".multi_user")), "bl_ext.blender_org.multi_user")
 LOG = f"/tmp/gui_{NAME}.log"
 
 

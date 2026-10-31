@@ -4,6 +4,16 @@ A test patch for the Blender Multi-User extension 0.8.2 (replication 0.10.3, Ble
 
 To build a Space with all of this from scratch, see [SETUP.md](SETUP.md) and run `setup.sh`.
 
+## The patched add-on
+
+`addon/` holds the whole add-on with every patch applied: `addon/multi_user/` is the extension and `addon/replication/` is the replication library it bundles as a wheel. The history shows the change against upstream. One commit adds Multi-User 0.8.2 and replication 0.10.3 as downloaded from extensions.blender.org, and the next applies the v2 and v3 patches, so its diff is the full change.
+
+`python3 build.py` packs `addon/` into `dist/multi_user-0.8.2+mu3.zip`, an extension Blender installs like any other: Edit > Preferences > Get Extensions > Install from Disk, or `blender -c extension install-file -r user_default -e <zip>`. Remove the upstream Multi-User first, since both use the id `multi_user`. The replication wheel inside is versioned `0.10.3+mu3` so Blender does not keep an upstream copy in its place.
+
+## License
+
+GPL-3.0-or-later, the license of Multi-User and replication, which this repository modifies. See [LICENSE](LICENSE). Multi-User and replication are by Swann Martinez and their contributors.
+
 `patch/v3/` is the current version. It is v2 plus merging of concurrent topology edits on one mesh, see "v3: topology merge" below. `patch/v2/` is the per-value merge without it. `patch/v1/` is the earlier three-way merge, kept for reference. It loses edits with three clients.
 
 ## v3: topology merge (2026-10-31)
