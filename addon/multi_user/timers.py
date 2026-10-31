@@ -193,6 +193,9 @@ class DynamicRightSelectTimer(Timer):
 
     def execute(self):
         settings = utils.get_preferences()
+        from replication import merge3 as _merge3  # patched: free editing
+        if getattr(_merge3, "FREE_EDIT", False):
+            return
 
         if session and session.state == STATE_ACTIVE:
             # Find user

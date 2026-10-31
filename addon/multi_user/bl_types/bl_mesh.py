@@ -52,7 +52,8 @@ GENERIC_ATTRIBUTES =[
     'crease_vert',
     'crease_edge',
     'bevel_weight_vert',
-    'bevel_weight_edge'
+    'bevel_weight_edge',
+    'mu_vid',  # patched: permanent vertex ids for the topology merge (replication/topo3.py)
 ]
 
 GENERIC_ATTRIBUTES_ENSURE = {

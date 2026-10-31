@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from . import net
 from .constants import ADDED, COMMITED, FETCHED, RP_COMMON, UP
+from . import merge3 as _merge3  # patched: three-way merge
 from .exception import (
     NonAuthorizedOperationError,
     UnsupportedTypeError,
@@ -114,8 +115,24 @@ def apply(repository, node_id, force=False, stamp=True):
                 except AttributeError:
                     logging.warning(f"Can stamp uuid on {type(node.instance)}")
         try:
-            repository.rdp.load(node.data, node.instance)
+            was_fetched = node.state == FETCHED  # patched: three-way merge
+            # merge on a forced reload too, so it cannot wipe uncommitted local edits
+            to_load, contributed = _merge3.merge_fetched(repository, node)
+            was_fetched = True
+            repository.rdp.load(to_load, node.instance)
             node.state = UP
+            last = _merge3._last_merge.pop(node.uuid, None) if was_fetched else None
+            if last is not None:
+                _merge3.remember_merged(node.uuid, last[0], last[1], contributed)
+            else:
+                _merge3.remember(node.uuid, node.data)
+            if contributed and _merge3.PUBLISH_MERGES:  # patched: LWW needs no republish
+                try:
+                    repository.assert_modification_rights(node.uuid)
+                    commit(repository, node.uuid)
+                    push(repository, "origin", node.uuid)
+                except Exception as e:
+                    logging.info(f"merge3: could not publish merge of {node.uuid}: {e}")
         except ReferenceError:
             logging.error(f"Apply reference error")
             node.instance = repository.rdp.resolve(node.data)
@@ -183,10 +200,11 @@ def commit(repository: Repository, node_id: str):
             repository.rdp.needs_update(node.instance, node.data) and node.state == UP
         ):
             new_version = repository.rdp.dump(node.instance, stamp_uuid=node.uuid)
+            new_version = _merge3.stamp_commit(node, new_version)  # patched: per-value stamps
 
             delta = repository.rdp.compute_delta(node.data, new_version)
             if delta and delta.diff:
-                if impl.use_delta and not node.state == ADDED:
+                if impl.use_delta and not node.state == ADDED and not _merge3.ENABLED:  # patched: full state carries stamps
                     commit = Commit()
                     commit.node_id = node.uuid
                     commit.deps = node.dependencies
@@ -197,6 +215,7 @@ def commit(repository: Repository, node_id: str):
                 else:
                     node.data = new_version
                 node.state = COMMITED
+                _merge3.after_commit(node.uuid, node.data)  # patched: base is the dumped state
                 logging.debug(f"Committed {node.uuid}")
             else:
                 logging.debug(f"Nothing to commit on node {node.uuid}")
@@ -276,7 +295,7 @@ def push(repository: Repository, remote: str, node_id, force=False):
         elif node.last_commit:
             repository.push(repository.remote.data, node.last_commit)
 
-        node.state = UP
+        node.state = _merge3.state_after_push(node.uuid, UP, FETCHED)  # patched
         node.last_commit = None
 
 

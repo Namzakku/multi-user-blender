@@ -225,16 +225,30 @@ class _Connection:
     def _read_ready(self):
         """Read available bytes and decode whichever messages completed.
         Returns None if the connection died."""
-        try:
-            data = self._sock.recv(RECV_BUFFER_SIZE)
-        except (BlockingIOError, InterruptedError):
+        # patched: drain the socket instead of one recv per poll, so a client
+        # that polls from a Blender timer keeps up with full-state updates
+        parts = []
+        for _ in range(256):
+            try:
+                part = self._sock.recv(RECV_BUFFER_SIZE)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                if parts:
+                    break
+                self._mark_closed()
+                return None
+            if part == b'':
+                if parts:
+                    break
+                self._mark_closed()
+                return None
+            parts.append(part)
+            if len(part) < RECV_BUFFER_SIZE:
+                break
+        if not parts:
             return []
-        except OSError:
-            self._mark_closed()
-            return None
-        if data == b'':
-            self._mark_closed()
-            return None
+        data = b''.join(parts)
         try:
             return self._reader.feed(data)
         except NetworkError as e:

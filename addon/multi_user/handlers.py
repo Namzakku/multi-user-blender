@@ -84,7 +84,7 @@ def on_scene_update(scene):
                 node = session.repository.graph.get(update_uuid)
                 check_common = session.repository.rdp.get_implementation(update.id).bl_check_common
 
-                if node and (node.owner == session.repository.username or check_common):
+                if node and (node.owner in (session.repository.username, RP_COMMON) or check_common):  # patched: also push COMMON-owned nodes
                     logging.debug(f"Evaluate {update.id.name}")
                     if node.state == UP:
                         try:

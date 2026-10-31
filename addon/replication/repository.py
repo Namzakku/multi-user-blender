@@ -28,6 +28,7 @@ from datetime import datetime
 
 from . import net
 from .constants import FETCHED, RP_COMMON, STATE_INITIAL
+from . import merge3 as _merge3  # patched: merge on receive
 from .exception import NonAuthorizedOperationError
 from .protocol import DataTranslationProtocol
 from .objects import Commit, Node, ReplicationObject
@@ -256,9 +257,11 @@ class Repository:
 
             if existing_node:
                 if delta_based:
+                    previous = existing_node.data
                     existing_node.patch(update)
+                    existing_node.data = _merge3.merge_incoming(previous, existing_node.data)  # patched
                 else:
-                    existing_node.data = update.data
+                    existing_node.data = _merge3.merge_incoming(existing_node.data, update.data)  # patched
                     existing_node.dependencies = update.dependencies
             elif not delta_based:
                 self.object_store[node_id] = update
