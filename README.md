@@ -8,13 +8,32 @@ To build a Space with all of this from scratch, see [SETUP.md](SETUP.md) and run
 
 `addon/` holds the whole add-on with every patch applied: `addon/multi_user/` is the extension and `addon/replication/` is the replication library it bundles as a wheel. The history shows the change against upstream. One commit adds Multi-User 0.8.2 and replication 0.10.3 as downloaded from extensions.blender.org, and the next applies the v2 and v3 patches, so its diff is the full change.
 
-`python3 build.py` packs `addon/` into `dist/multi_user-0.8.2+mu3.zip`, an extension Blender installs like any other: Edit > Preferences > Get Extensions > Install from Disk, or `blender -c extension install-file -r user_default -e <zip>`. Remove the upstream Multi-User first, since both use the id `multi_user`. The replication wheel inside is versioned `0.10.3+mu3` so Blender does not keep an upstream copy in its place.
+`python3 build.py` packs `addon/` into `dist/multi_user-0.8.2+mu4.zip`, an extension Blender installs like any other: Edit > Preferences > Get Extensions > Install from Disk, or `blender -c extension install-file -r user_default -e <zip>`. Remove the upstream Multi-User first, since both use the id `multi_user`. The replication wheel inside is versioned `0.10.3+mu4` so Blender does not keep an upstream copy in its place.
+
+`addon/` is the current version: v3 plus the mu4 changes below. `patch/` keeps the earlier versions as patches against upstream, for reference. `patch/v3/` is v2 plus merging of concurrent topology edits on one mesh, see "v3: topology merge" below. `patch/v2/` is the per-value merge without it. `patch/v1/` is the earlier three-way merge. It loses edits with three clients. `tests/test_sim.py` runs the offline simulation against `addon/replication`, with `python tests/test_sim.py`.
+
+## mu4: conflict notices, deletion, client numbers, pruning (2026-10-31)
+
+Changes made directly in `addon/`, on top of v3.
+
+- **Conflict notices.** When two users' topology edits clash and one is dropped, every Blender in the session shows a popup and a red box at the top of the Multi-User panel, naming the object, both users and how many elements were dropped. Each conflict is reported once. The commit that writes a resolution down (a settle commit) records what it settled, so a Blender that never saw the conflict open still reports it. Settle commits do not conflict with each other: in the first live run, two concurrent settle commits produced a second, wrong notice.
+- **Deleting an object.** The deleting Blender marks the `Delete` command when the datablock is really gone (`client:deleted`). The other Blenders remove their copy too, in `ApplyTimer`. An object in Edit Mode waits until its user leaves Edit Mode. A "stop tracking" (`wm.session_datablock_ignore`) is not marked and removes nothing.
+- **Client numbers.** Each mesh's table holds a register of client numbers by username. A user takes the number its username hashes to, or the next free one, and keeps it. Two usernames with the same hash no longer share a number, so their fresh vertex ids no longer collide.
+- **Pruning.** A commit that every active client has seen, and that is at least `PRUNE_SETTLE` (120 s) older than the newest commit in the table, is dropped from the table along with the tombstones it left. The check uses only the table, so every replica prunes the same way, and a prune that would change the mesh is skipped. A client whose newest topology commit is `PRUNE_AGE` (600 s) older than the newest one stops holding pruning back.
+- `.gitattributes` keeps every text file LF.
+
+Results:
+
+| Test | Result |
+|---|---|
+| `tests/test_sim.py` | 20 of 20 pass: the 13 v3 cases, plus number register, colliding usernames, pruning a settled commit, a conflict kept until settled, the no-change guard, concurrent settle commits and notices |
+| Live, two Spaces, one Blender each (`tests/live_session.py`), alice hosts, bob joins. At +50 s both edit the centre of the box top at once: alice pokes, bob insets. At +90 s alice deletes the object `Doomed`. At +200 s bob pokes the +X side, at +330 s alice pokes the bottom | Pass. Bob's inset won, and each Blender showed exactly one notice: "'Shared_box': alice and bob edited the same vertices at once. Kept bob's edit, dropped 19 element(s)." `Doomed` disappeared from bob's Blender within 5 s ("Removed Doomed, deleted by another user"). Both Blenders held the same mesh by id at every 5 s sample. The table went from 5 commits to 4 at +200 s (alice's settled commits pruned) and to 1 at +330 s, with tombstones from 64 to 16. No conflicts left and no tracebacks |
+| GUI check, same setup, screenshots of both Blenders 2 s after the clash | The popup shows in both, titled "Multi-User: concurrent edit", with the object, both users and the count. The panel box was not seen: a script cannot switch the sidebar to the Multiuser tab |
+| Same-region clash, repeated: four runs at the same moment, one with alice 0.3 s later, and one on the plain v3 code with alice 0.3 s later | **Fails sometimes, before and after mu4.** v3 ended at 110 vertices and 120 faces: poke and inset both applied to the same four faces. One of the four mu4 runs ended at 106 and 108, a mix of the two. In the 0.3 s mu4 run alice poked on top of bob's inset after it arrived (12 faces), which should give 118 and 140, and it ended at 115 and 140. Both Blenders always held the same mesh, and in the failing runs the notices named different winners. See "Known limits" |
 
 ## License
 
 GPL-3.0-or-later, the license of Multi-User and replication, which this repository modifies. See [LICENSE](LICENSE). Multi-User and replication are by Swann Martinez and their contributors.
-
-`patch/v3/` is the current version. It is v2 plus merging of concurrent topology edits on one mesh, see "v3: topology merge" below. `patch/v2/` is the per-value merge without it. `patch/v1/` is the earlier three-way merge, kept for reference. It loses edits with three clients.
 
 ## v3: topology merge (2026-10-31)
 
@@ -58,9 +77,11 @@ The first topo run failed: every client numbered the mesh on its own, and those 
 v3 limits, in addition to v2's:
 
 - Vertex colors and other attributes (crease, bevel weight) switch the mesh back to v2's whole-mesh rule, because a rebuild would drop them. Shape keys and vertex groups are not part of the mesh dump and are not handled.
-- Two edits that share even one base vertex conflict, and the older one is dropped in that region, without a warning in the Blender UI. The add-on log has a `topo3:` line.
-- The table keeps tombstones and commit records for the whole session. It is never pruned.
-- Client numbers come from a hash of the username into 255 values, so two users can collide. Not detected.
+- Two edits that share even one base vertex conflict, and the older one is dropped in that region. Since mu4 every Blender shows a notice.
+- **Edits on one region less than about a second apart can end mixed.** Not fixed, and present in v3 as well as mu4. Both edits, or parts of each, end up in the mesh, and every Blender holds the same wrong mesh. The saved tables show extra commits made while merging: an update arrives before the local edit's own commit, and the merge records the local mesh as a commit. Those commits and the settle commits after them decide the result. `tests/live_session.py` with `DUMP=1` saves the tables to replay offline.
+- Two new users who make their first topology edit on one mesh at the same moment, with usernames that hash to the same number, both take it. The table logs a warning, and their fresh ids can collide. Users with the same username always share a number.
+- A topology commit that arrives more than `PRUNE_SETTLE` after a concurrent commit it overlaps, for example from a user who stayed in Edit Mode that long, is merged without the conflict rule, entry by entry. Tombstones dropped by pruning can come back from such a client.
+- Pruning drops commit records and tombstones only. Every vertex, face and loose edge of the current mesh stays in the table, and the client number register is never pruned.
 - The first edit on a client before any ids were loaded maps vertices by index, which is right when Blender appended the new vertices. After a deletion it falls back to matching positions.
 - Loop cut, connect vertex path, merge and Knife have each been run on v3 (loop cut, connect and merge scripted through the real operators, Knife by a GUI agent). A loop cut whose ring leaves your region will touch other users' regions and can conflict. A three-agent GUI run has not been completed on v3.
 
@@ -117,12 +138,12 @@ In runs 2 and 3 the agents were told to select only in the 3D viewport, to click
 
 ## Known limits
 
-- **Deleting an object splits the session.** Upstream sends a `Delete` command that removes the node from every client's repository, but nothing removes the object itself from the other Blenders. They keep a copy that no longer syncs, and their later edits to it stay local, without any warning. Found in the three-agent run. Not fixed.
+- **Deleting an object** split the session up to v3: upstream removed the node from every repository but left the object in the other Blenders, where it stopped syncing. Fixed in mu4 (see above). The mesh of a deleted object stays as orphan data in every Blender, as it does in the deleting one.
 - **Stale-restore rule.** A value set back to one that an incoming update replaced, within the last 64 updates to that node, is ignored. A user who deliberately types the old value back is ignored too. An undo that reaches further back than 64 updates can still restore other users' old values.
 - **CPU.** Three Blender GUIs and the server diverged on 2 CPUs: one client fell behind and was still stale at the final check. They converged on 6 CPUs. Real users run one Blender per machine, so this test is harsher than real use, but a slow client can still lag.
 - **Bandwidth.** A full-state mesh update is about 210 KB for the 482-vertex head, against a few KB for a delta. The stamps take twice the space of the data they cover. Large meshes will need deltas of stamped values instead.
 - **Clocks.** Stamps use `time.time()`. Across machines the clocks must be in sync (NTP) for "last" to mean anything.
-- **Topology.** Topology changes are not merged: one side's whole mesh wins.
+- **Topology.** In v2, topology changes are not merged: one side's whole mesh wins. v3 merges them, see above.
 - **New objects.** Upstream sends a new object only after its owner's first edit, and objects added in the same second can be lost. This patch does not change either.
 - **Edit Mode.** Mesh edits made in Edit Mode sync when the user leaves Edit Mode. An incoming update waits while the receiver is in Edit Mode.
 

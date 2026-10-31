@@ -427,7 +427,11 @@ def rm(repository: Repository, node_id: str, remove_dependencies: bool = True):
 
         logging.debug(f"Removing node {nodes_to_delete}")
         for node in nodes_to_delete:
-            delete_command = Delete(owner="client", data=node)
+            # patched: say when the datablock is gone here, so other clients
+            # remove theirs too instead of keeping a copy that no longer syncs
+            ref = repository.graph.get(node)
+            gone = ref is not None and repository.rdp.resolve(ref.data) is None
+            delete_command = Delete(owner="client:deleted" if gone else "client", data=node)
             # remove the key from our store
             repository.push(repository.remote.command, delete_command)
     else:

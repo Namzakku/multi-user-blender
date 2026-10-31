@@ -174,6 +174,13 @@ class SESSION_PT_settings(bpy.types.Panel):
             row.operator("wm.session_firstlaunch_verify", text="Continue")
 
         if not settings.is_first_launch:
+            from replication import merge3 as _merge3  # patched: merge conflict notices
+            notices = getattr(_merge3, "NOTICES", [])[-3:]
+            if notices and session and session.state == STATE_ACTIVE:
+                box = layout.box()
+                box.alert = True
+                for _, text in notices:
+                    box.label(text=text, icon='ERROR')
             if hasattr(context.window_manager, 'session'):
                 # STATE INITIAL
                 if not session or (session and session.state == STATE_INITIAL):

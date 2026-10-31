@@ -110,9 +110,62 @@ class SessionListenTimer(Timer):
         session.listen()
 
 
+def remove_deleted():
+    """patched: remove datablocks another client deleted. An object in Edit Mode
+    stays until its user leaves Edit Mode; data still in use stays too."""
+    pending = getattr(session.repository, "deleted_instances", None)
+    if not pending:
+        return
+    from replication import merge3 as _merge3
+    keep = []
+    for uuid, instance in pending:
+        try:
+            if getattr(instance, "mode", "OBJECT") == "EDIT" or \
+                    (not isinstance(instance, bpy.types.Object) and instance.users > 0):
+                keep.append((uuid, instance))
+                continue
+            name = instance.name
+            bpy.data.batch_remove([instance])
+            logging.info(f"Removed {name}, deleted by another user")
+        except ReferenceError:
+            pass  # already gone
+        except Exception:
+            logging.error(f"Fail to remove deleted datablock {uuid}")
+            traceback.print_exc()
+        _merge3.forget(uuid)
+    pending[:] = keep
+
+
+_notices_shown = 0
+
+
+def show_notices():
+    """patched: pop up each new merge conflict notice once."""
+    global _notices_shown
+    from replication import merge3 as _merge3
+    fresh = [text for seq, text in getattr(_merge3, "NOTICES", []) if seq > _notices_shown]
+    if not fresh:
+        return
+    _notices_shown = _merge3.NOTICES[-1][0]
+    wm = bpy.context.window_manager
+    if not wm.windows:
+        return
+
+    def draw(menu, context):
+        for text in fresh:
+            menu.layout.label(text=text, icon='ERROR')
+    try:
+        with bpy.context.temp_override(window=wm.windows[0]):
+            wm.popup_menu(draw, title="Multi-User: concurrent edit", icon='ERROR')
+    except Exception as e:
+        logging.warning(f"Cannot show the merge notice: {e}")
+
+
 class ApplyTimer(Timer):
     def execute(self):
         if session and session.state == STATE_ACTIVE:
+            remove_deleted()
+            show_notices()
             for node in session.repository.graph.keys():
                 node_ref = session.repository.graph.get(node)
 

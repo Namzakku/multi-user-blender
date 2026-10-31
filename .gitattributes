@@ -1,0 +1,6 @@
+# Keep every text file LF in the repository and in checkouts. The add-on and
+# replication ship CRLF upstream; patch(1) and the Space scripts need LF.
+* text=auto eol=lf
+*.whl binary
+*.png binary
+*.zip binary

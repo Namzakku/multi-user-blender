@@ -448,6 +448,16 @@ class Session(object):
                 self.handle_server_repository_init(command)
 
             # GRAPH OPERATION (DELETE, CHANGE_RIGHT)
+            if type(command) is Delete and command.owner == "client:deleted":
+                # patched: the sender deleted the datablock; queue ours for the
+                # add-on to remove (it waits while the object is in Edit Mode)
+                node = self.repository.graph.get(command.data)
+                if node is not None:
+                    instance = self.repository.rdp.resolve(node.data)
+                    if instance is not None:
+                        if not hasattr(self.repository, "deleted_instances"):
+                            self.repository.deleted_instances = []
+                        self.repository.deleted_instances.append((command.data, instance))
             if type(command) in [Delete, Right]:
                 command.execute(self.repository.object_store)
 

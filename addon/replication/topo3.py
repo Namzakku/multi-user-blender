@@ -7,6 +7,10 @@ and loose edge that has ever existed, keyed by permanent ids:
     "f": {"<vid>,<vid>,...": [alive, stamp, cid, use_smooth, material_index]}
     "e": {"<vid>,<vid>": [alive, stamp, cid]}           loose edges only
     "c": {cid: [client, stamp, {"<client>": newest stamp of that client seen}]}
+         a settle commit adds 1 and [[winner cid, loser cids, hidden, winner, losers]]
+    "n": {"<client>": [username, stamp]}        who holds each client number
+    "k": {"<client>": {"<client>": stamp}}      newest stamp each client has seen
+    "s": {"<client>": stamp}                    newest stamp of pruned commits
 
 A deletion is an entry with alive 0 (a tombstone). Two tables merge entry by
 entry, newest stamp wins, so the result is the same in any order and on the
@@ -19,8 +23,13 @@ commit from any client makes that permanent.
 
 Vertex ids live in the integer attribute ID_ATTR. Blender copies an existing id
 onto every vertex an edit creates, so `repair_ids` runs before each diff.
-Meshes with UVs, vertex colors or other attributes are left to the old
-whole-mesh rule, because a rebuild would drop that data.
+Fresh ids carry the creating client's number in their high bits. Numbers are
+claimed per table in "n", so two users never share one.
+Meshes with vertex colors or other attributes are left to the old whole-mesh
+rule, because a rebuild would drop that data.
+
+A commit every active client has seen can no longer conflict. `prune` then
+drops its record and the tombstones it left, when that does not change the mesh.
 """
 import copy
 import logging
@@ -33,16 +42,26 @@ ENABLED = True
 TOPO_KEY = "_mu_topo"
 ID_ATTR = "mu_vid"
 CLIENT_SHIFT = 23
+MAX_CLIENT = 255
+# Pruning, in seconds of table time (the newest stamp in the table). A commit
+# is pruned once every active client has seen it and it is PRUNE_SETTLE older
+# than the newest commit, so a concurrent commit from a client the table does
+# not know yet has time to arrive. A client whose newest topology commit is
+# PRUNE_AGE older than the newest one no longer holds back pruning.
+PRUNE_SETTLE = 120.0
+PRUNE_AGE = 600.0
 GEOM_KEYS = ("vertex_count", "vertices", "egdes_count", "edges", "loop_count", "loops",
              "poly_count", "polygons", "attributes", "uv_layers", "vertex_colors")
-_client = None
+_username = None
+# Set by merge_mesh: the view and table of the last merge, for conflict notices.
+LAST = None
 
 
 # ---------------------------------------------------------------- ids and keys
-def client_no():
-    """1..255 from the Multi-User username, the high bits of fresh ids."""
-    global _client
-    if _client is None:
+def username():
+    """The Multi-User username, or the process id when there is none."""
+    global _username
+    if _username is None:
         name = ""
         try:
             import bpy
@@ -54,10 +73,31 @@ def client_no():
             pass
         if not name:
             import os
-            name = str(os.getpid())
-        _client = zlib.crc32(name.encode()) % 255 + 1
-        logging.info(f"topo3: client number {_client} for '{name}'")
-    return _client
+            name = f"pid{os.getpid()}"
+        _username = name
+    return _username
+
+
+def claim(topo, name, now):
+    """This user's client number in the table, 1..MAX_CLIENT, the high bits of
+    fresh ids. A number already held by another name is skipped."""
+    reg = topo.setdefault("n", {})
+    for no, entry in reg.items():
+        if entry[0] == name:
+            return int(no)
+    start = zlib.crc32(name.encode()) % MAX_CLIENT
+    for k in range(MAX_CLIENT):
+        no = (start + k) % MAX_CLIENT + 1
+        if str(no) not in reg:
+            reg[str(no)] = [name, now]
+            logging.info(f"topo3: client number {no} for '{name}'")
+            return no
+    raise RuntimeError(f"topo3: all {MAX_CLIENT} client numbers are taken")
+
+
+def name_of(topo, no):
+    entry = (topo.get("n") or {}).get(str(no))
+    return entry[0] if entry else f"client {no}"
 
 
 def face_key(face):
@@ -210,12 +250,14 @@ def _alive_verts(topo):
     return {int(k): tuple(e[3:6]) for k, e in topo.get("v", {}).items() if e[0]}
 
 
-def attach(base, dump, now, client=None):
+def attach(base, dump, now, client=None, name=None):
     """Return (dump with ids and an updated table, info) for a fresh local dump.
 
     base is the last synced data (may carry a table). info is None when the
     mesh is not handled here; otherwise it says whether ids changed in the dump,
-    which then has to be loaded back into the datablock.
+    which then has to be loaded back into the datablock. client forces a client
+    number (tests); otherwise the number is claimed for name, by default the
+    Multi-User username.
     """
     if not ENABLED or not is_mesh(dump):
         return dump, None
@@ -223,7 +265,6 @@ def attach(base, dump, now, client=None):
         dump = dict(dump)
         dump.pop(TOPO_KEY, None)
         return dump, None
-    client = client or client_no()
     base_topo = base.get(TOPO_KEY) if isinstance(base, dict) else None
     synced = base if isinstance(base, dict) and is_mesh(base) and not unsupported(base) else None
     synced_ids = _ids_or_index(synced) if synced is not None else None
@@ -236,13 +277,14 @@ def attach(base, dump, now, client=None):
         # no commit can conflict with. The local edit is then diffed against it.
         src = synced if synced is not None else dump
         m = decode(src, synced_ids if synced is not None else _ids_or_index(dump))
-        topo = {"v": {}, "f": {}, "e": {}, "c": {}}
+        topo = {"v": {}, "f": {}, "e": {}, "c": {}, "n": {}}
         for vid, pos in m["verts"].items():
             topo["v"][str(vid)] = [1, 0.0, "init", *pos]
         for key, (smooth, mat) in m["faces"].items():
             topo["f"][kstr(key)] = [1, 0.0, "init", smooth, mat]
         for key in m["edges"]:
             topo["e"][kstr(key)] = [1, 0.0, "init"]
+    client = client or claim(topo, name or username(), now)
 
     co = _buf(dump["vertices"], "co", np.float32, 3)
     ids = get_ids(dump)
@@ -276,6 +318,20 @@ def attach(base, dump, now, client=None):
     if synced is not None and len(synced_ids) == len(_buf(synced["vertices"], "co", np.float32, 3)):
         base_co = _buf(synced["vertices"], "co", np.float32, 3)
         last = {int(synced_ids[i]): [float(c) for c in base_co[i]] for i in range(len(base_co))}
+
+    # A commit whose mesh is the table's view, while that view hides a conflict,
+    # only writes down how the conflict was resolved. Every client that applies
+    # the resolution makes one at about the same time; they never conflict.
+    # It records what it settled, so a client that never saw the conflict open
+    # can still tell its user.
+    settle = None
+    if base_topo:
+        bv = view(topo)
+        if bv["hidden"] > 0 and set(mesh["verts"]) == set(bv["verts"]) \
+                and set(mesh["faces"]) == set(bv["faces"]) and mesh["edges"] == bv["edges"]:
+            cs = topo["c"]
+            settle = [[cl["win"], cl["lose"], cl["hidden"], name_of(topo, cs[cl["win"]][0]),
+                       [name_of(topo, cs[c][0]) for c in cl["lose"]]] for cl in bv["clashes"]]
 
     cid = f"{client}:{now:.6f}"
     changed = False
@@ -312,10 +368,15 @@ def attach(base, dump, now, client=None):
             te[ks] = [0, now, cid]
             changed = True
     if changed:
-        seen = {}
+        seen = dict(topo.get("s") or {})
         for c in topo["c"].values():
             seen[str(c[0])] = max(seen.get(str(c[0]), 0.0), c[1])
-        topo["c"][cid] = [client, now, seen]
+        topo["c"][cid] = [client, now, seen, 1, settle] if settle is not None else [client, now, seen]
+        acks = topo.setdefault("k", {})
+        mine = dict(acks.get(str(client)) or {})
+        for k, t in list(seen.items()) + [(str(client), now)]:
+            mine[k] = max(mine.get(k, -1.0), t)
+        acks[str(client)] = mine
     dump[TOPO_KEY] = topo
     return dump, {"ids_changed": ids_changed, "repaired": n, "topology_changed": changed}
 
@@ -337,7 +398,58 @@ def merge_topo(ta, tb):
     c = dict(ta.get("c", {}))
     c.update(tb.get("c", {}))
     out["c"] = c
+    reg = dict(ta.get("n") or {})
+    for no, entry in (tb.get("n") or {}).items():
+        mine = reg.get(no)
+        if mine is not None and mine[0] != entry[0]:
+            logging.warning(f"topo3: '{mine[0]}' and '{entry[0]}' claimed client number {no} at once")
+        if mine is None or (entry[1], entry[0]) < (mine[1], mine[0]):
+            reg[no] = entry
+    out["n"] = reg
+    acks = {x: dict(v) for x, v in (ta.get("k") or {}).items()}
+    for x, v in (tb.get("k") or {}).items():
+        mine = acks.setdefault(x, {})
+        for k, t in v.items():
+            mine[k] = max(mine.get(k, -1.0), t)
+    out["k"] = acks
+    pruned = dict(ta.get("s") or {})
+    for k, t in (tb.get("s") or {}).items():
+        pruned[k] = max(pruned.get(k, -1.0), t)
+    out["s"] = pruned
     return out
+
+
+def prune(topo):
+    """The table without commits every active client has seen, and without the
+    tombstones they left. Returns topo itself when there is nothing to drop.
+    Decided from the table alone, so every replica prunes the same way."""
+    commits = topo.get("c") or {}
+    acks = topo.get("k") or {}
+    if not commits:
+        return topo
+    last = {x: v.get(x, -1.0) for x, v in acks.items()}
+    newest = max(last.values(), default=0.0)
+    active = [x for x, t in last.items() if t >= newest - PRUNE_AGE]
+    newest = max([newest] + [c[1] for c in commits.values()])
+    stable = {cid for cid, (author, t, *_) in commits.items()
+              if t <= newest - PRUNE_SETTLE
+              and all(x == str(author) or acks[x].get(str(author), -1.0) >= t for x in active)}
+    if not stable:
+        return topo
+    out = dict(topo)
+    out["c"] = {cid: c for cid, c in commits.items() if cid not in stable}
+    pruned = dict(topo.get("s") or {})
+    for cid in stable:
+        author, t = str(commits[cid][0]), commits[cid][1]
+        pruned[author] = max(pruned.get(author, -1.0), t)
+    out["s"] = pruned
+    for sec in ("v", "f", "e"):
+        out[sec] = {k: e for k, e in topo.get(sec, {}).items() if e[0] or e[2] in out["c"]}
+    return out
+
+
+def same_mesh(x, y):
+    return x["verts"] == y["verts"] and x["faces"] == y["faces"] and x["edges"] == y["edges"]
 
 
 # ---------------------------------------------------------------- view
@@ -403,7 +515,7 @@ def _units(topo):
 def view(topo):
     """Alive mesh of a table, with concurrent conflicts resolved. Pure function."""
     commits = topo.get("c", {})
-    units = [u for u in _units(topo) if u["cid"] in commits]
+    units = [u for u in _units(topo) if u["cid"] in commits and len(commits[u["cid"]]) < 4]
     by_vert = {}
     for i, u in enumerate(units):
         for v in u["fp"]:
@@ -425,6 +537,7 @@ def view(topo):
 
     hidden = set()
     conflicts = 0
+    clashes = []
     for members in clusters.values():
         cids = {units[i]["cid"] for i in members}
         if len(cids) < 2:
@@ -434,9 +547,12 @@ def view(topo):
         if not losers:
             continue
         conflicts += 1
+        dropped = set()
         for i in members:
             if units[i]["cid"] in losers:
-                hidden.update(units[i]["elems"])
+                dropped.update(units[i]["elems"])
+        hidden |= dropped
+        clashes.append({"win": win, "lose": sorted(losers), "hidden": len(dropped)})
 
     def alive(sec, k, e):
         return (not e[0]) if (sec, k) in hidden else bool(e[0])
@@ -452,7 +568,8 @@ def view(topo):
         key = kparse(k)
         if alive("e", k, e) and all(v in verts for v in key):
             edges.add(key)
-    return {"verts": verts, "faces": faces, "edges": edges, "conflicts": conflicts, "hidden": len(hidden)}
+    return {"verts": verts, "faces": faces, "edges": edges, "conflicts": conflicts, "hidden": len(hidden),
+            "clashes": clashes}
 
 
 # ---------------------------------------------------------------- rebuild
@@ -608,8 +725,13 @@ def matches_view(d, v):
 
 def merge_mesh(a, ats, b, bts, lww):
     """merge3.lww for two mesh dicts that both carry a table."""
+    global LAST
     topo = merge_topo(a[TOPO_KEY], b[TOPO_KEY])
     v = view(topo)
+    small = prune(topo)
+    if small is not topo and same_mesh(view(small), v):
+        topo = small
+    LAST = (v, topo)
     ra = {k: x for k, x in a.items() if k != TOPO_KEY}
     rb = {k: x for k, x in b.items() if k != TOPO_KEY}
     if _same_layout(a, b) and matches_view(a, v):

@@ -43,6 +43,12 @@ _carry = {}  # uuid -> (merged data, merged stamps) awaiting the commit that pub
 # one of these values; such a write is not a new edit.
 _superseded = {}
 SUPERSEDED_KEEP = 64
+# Concurrent topology edits where one side was dropped, newest last, as
+# (sequence number, text). The add-on shows them in the Multi-User panel.
+NOTICES = []
+NOTICES_KEEP = 20
+_notice_seq = 0
+_noticed = set()  # loser commit ids already reported
 
 
 # ---------------------------------------------------------------- helpers
@@ -355,7 +361,10 @@ def merge_fetched(repository, node):
     rts = stamps_of(remote)
     if rts is None:  # sender without stamps: treat all its values as just written
         rts = stamp(_MISSING, None, strip(remote), now)
+    topo3.LAST = None
     merged, mts = lww(local, lts, strip(remote), rts)
+    if topo3.LAST is not None:
+        _notice_clashes(_label(node), *topo3.LAST)
     if not _eq(topo3.drop(merged), dumped):
         note_superseded(node.uuid, dumped, topo3.drop(merged))
     kept = not _eq(merged, strip(remote))
@@ -370,6 +379,50 @@ def merge_fetched(repository, node):
 
 
 _last_merge = {}
+
+
+def _label(node):
+    """The object a mesh belongs to, the name users see, else the mesh name."""
+    name = getattr(node.instance, "name", node.uuid)
+    try:
+        import bpy
+        owners = [o.name for o in bpy.data.objects if o.data == node.instance]
+        return owners[0] if owners else name
+    except Exception:
+        return name
+
+
+def _notice_clashes(name, v, topo):
+    """Report each concurrent topology conflict once, naming who kept their edit."""
+    global _notice_seq
+    commits = topo.get("c", {})
+    found = []  # (loser cids, hidden, winner name, loser names)
+    for clash in v.get("clashes", []):
+        if clash["win"] in commits and all(c in commits for c in clash["lose"]):
+            found.append((clash["lose"], clash["hidden"], topo3.name_of(topo, commits[clash["win"]][0]),
+                          [topo3.name_of(topo, commits[c][0]) for c in clash["lose"]]))
+    for record in commits.values():  # conflicts a settle commit already resolved
+        if len(record) > 4:
+            for _, lose, hidden, winner, losers in record[4]:
+                found.append((lose, hidden, winner, losers))
+    for lose, hidden, winner, losers in found:
+        if all(c in _noticed for c in lose):
+            continue
+        _noticed.update(lose)
+        losers = ", ".join(sorted(set(losers)))
+        text = (f"'{name}': {losers} and {winner} edited the same vertices at once. "
+                f"Kept {winner}'s edit, dropped {hidden} element(s).")
+        logging.warning(f"merge3: {text}")
+        _notice_seq += 1
+        NOTICES.append((_notice_seq, text))
+        del NOTICES[:-NOTICES_KEEP]
+
+
+def forget(uuid):
+    """Drop the caches of a node that was deleted."""
+    for cache in (_base, _carry, _superseded, _commit_base, _last_merge):
+        cache.pop(uuid, None)
+    _reapply.discard(uuid)
 
 
 def merge_incoming(old, new):

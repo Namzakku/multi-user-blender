@@ -5,7 +5,7 @@ How to build a cua Space that runs Blender with the patched Multi-User add-on (v
 ## What you get
 
 - Blender 5.2.2 in `/opt/blender`, on the path as `blender`
-- The patched Multi-User from `addon/` (upstream 0.8.2 with the v2 and v3 patches applied), built by `build.py` and installed for the user `cua` as `multi_user 0.8.2+mu3`: per-value merging, and topology merging by permanent vertex id (see [README.md](README.md))
+- The patched Multi-User from `addon/` (upstream 0.8.2 with the v2 and v3 patches applied), built by `build.py` and installed for the user `cua` as `multi_user 0.8.2+mu4`: per-value merging, and topology merging by permanent vertex id (see [README.md](README.md))
 - `~/mu/gui_session.py` to host or join a session, and `~/stress/` with the stress harness
 
 ## 1. Create the Space
@@ -66,4 +66,6 @@ docker exec -u cua -e HOME=/home/cua -e SETTLE=40 <container> sh /home/cua/stres
 docker exec -u cua <container> sh -c 'cd /home/cua/stress && python3 check_topo.py out_topo_3'
 ```
 
-Expect `CONVERGED mesh by id: True` and `ALL EDITS PRESENT: True`. The topo scenario needs `two_agent_build.blend` with an `A_head` mesh in `~/stress/`, which is not in the repo. Without it, use `BLEND=<file> OBJ=<mesh object>` with the `ops` scenario (see README.md).
+Expect `CONVERGED mesh by id: True` and `ALL EDITS PRESENT: True`.
+
+For conflict notices, deletion and pruning, run `~/mu/live_session.py` in two Spaces with the same `T0` (a Unix time about 20 s ahead), `ROLE=host NAME=alice` in one and `ROLE=client NAME=bob IP=<host ip>` in the other, the same way as `gui_session.py` above. It takes about 6 minutes and logs to `/tmp/live_<NAME>.log`. Its docstring lists what to expect at each step. The topo scenario needs `two_agent_build.blend` with an `A_head` mesh in `~/stress/`, which is not in the repo. Without it, use `BLEND=<file> OBJ=<mesh object>` with the `ops` scenario (see README.md).

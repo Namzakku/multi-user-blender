@@ -3,7 +3,7 @@
     python3 build.py            -> dist/multi_user-<version>.zip
 
 The replication package is packed back into a wheel with a local version tag
-(0.10.3+mu3), so Blender extracts it instead of reusing an upstream 0.10.3
+(0.10.3+mu4), so Blender extracts it instead of reusing an upstream 0.10.3
 wheel it has seen before. Text files are written with LF line endings.
 Needs only the Python standard library.
 """
@@ -12,7 +12,7 @@ import base64, hashlib, io, os, re, shutil, sys, zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ADDON = os.path.join(HERE, "addon")
 DIST = os.path.join(HERE, "dist")
-UP_VERSION, TAG = "0.10.3", "mu3"
+UP_VERSION, TAG = "0.10.3", "mu4"
 WHEEL_VERSION = f"{UP_VERSION}+{TAG}"
 WHEEL_NAME = f"replication-{WHEEL_VERSION}-py3-none-any.whl"
 TEXT = (".py", ".toml", ".txt", ".md")
