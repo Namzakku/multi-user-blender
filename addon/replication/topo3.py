@@ -119,11 +119,24 @@ def kparse(s):
     return tuple(int(v) for v in s.split(","))
 
 
+def _pos_key(pos):
+    # float() first: a numpy float32 and a Python float of the same value are
+    # not equal, so a mesh coordinate would never find its table entry
+    return tuple(round(float(c), 5) for c in pos)
+
+
+def _f32(vid):
+    return int(np.float32(vid))
+
+
 def repair_ids(ids, coords, base_verts, client):
-    """Unique ids after a local edit. In a group of equal ids the vertex nearest
-    that id's base position keeps it. Every other vertex first takes a base id
-    that is missing from the mesh and sits at the same position (so repeating a
-    repair gives the same ids), then a fresh id."""
+    """Unique ids after a local edit, the same ids every time it is repeated on
+    the same mesh. In a group of equal ids the vertex nearest that id's base
+    position keeps it. A vertex whose id is not in the base, or that lost its
+    group, takes in turn: a base id missing from the mesh at its position; the
+    nearest missing base id that float32 rounds to its id (Blender passes the id
+    attribute through float32 in some operators, so ids above 2**24 lose their
+    low bits on vertices the edit did not touch); a fresh id."""
     ids = [int(v) for v in ids]
     groups = {}
     for i, vid in enumerate(ids):
@@ -131,7 +144,7 @@ def repair_ids(ids, coords, base_verts, client):
     out = list(ids)
     needs = []
     for vid, members in groups.items():
-        if vid <= 0:
+        if vid <= 0 or (base_verts and vid not in base_verts):
             needs.extend(members)
         elif len(members) > 1:
             if vid in base_verts:
@@ -142,20 +155,39 @@ def repair_ids(ids, coords, base_verts, client):
             needs.extend(i for i in members if i != keeper)
     if not needs:
         return out, 0
-    present = set(ids)
-    spare = {}
+    needs = sorted(needs)
+    need_set = set(needs)
+    present = {ids[i] for i in range(len(ids)) if i not in need_set}  # ids kept as they are
+    spare, rounded = {}, {}
     for vid, pos in base_verts.items():
         if vid not in present:
-            spare.setdefault(tuple(round(c, 5) for c in pos), []).append(vid)
-    used = set(base_verts) | present
-    top = max([v & ((1 << CLIENT_SHIFT) - 1) for v in used if v >> CLIENT_SHIFT == client] or [0])
-    for i in sorted(needs):
-        slot = spare.get(tuple(round(c, 5) for c in coords[i]))
+            spare.setdefault(_pos_key(pos), []).append(vid)
+    taken = set()
+    rest = []
+    for i in needs:
+        slot = [v for v in spare.get(_pos_key(coords[i]), []) if v not in taken]
         if slot:
-            out[i] = slot.pop(0)
-            continue
-        top += 1
-        out[i] = (client << CLIENT_SHIFT) | top
+            out[i] = slot[0]
+            taken.add(slot[0])
+        else:
+            rest.append(i)
+    for vid in base_verts:
+        if vid not in present and vid not in taken:
+            rounded.setdefault(_f32(vid), []).append(vid)
+    pairs = sorted((math.dist(coords[i], base_verts[vid]), i, vid)
+                   for i in rest if ids[i] > 0 for vid in rounded.get(_f32(ids[i]), []))
+    done = set()
+    for _, i, vid in pairs:
+        if i not in done and vid not in taken:
+            out[i] = vid
+            done.add(i)
+            taken.add(vid)
+    used = set(base_verts) | set(out)
+    top = max([v & ((1 << CLIENT_SHIFT) - 1) for v in used if v >> CLIENT_SHIFT == client] or [0])
+    for i in rest:
+        if i not in done:
+            top += 1
+            out[i] = (client << CLIENT_SHIFT) | top
     return out, len(needs)
 
 

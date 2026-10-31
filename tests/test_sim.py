@@ -516,6 +516,49 @@ class ImprovementTests(unittest.TestCase):
         self.assertEqual(len(merge3.NOTICES), 1)
         self.assertIn("Kept bob's edit", merge3.NOTICES[0][1])
 
+    def test_repeated_repair_gives_the_same_ids(self):
+        """An edit made new vertices that copied ids, at coordinates float32
+        cannot hold exactly. The commit repaired them, and an update arrived
+        before the repaired ids were loaded back. Attaching the same unrepaired
+        dump again must give the same ids and no topology change."""
+        state = load(self.start)
+        v, f, ids = state
+        inner = []
+        fi = find_face(v, f, ids, Q(1, 1))
+        quad = f[fi]
+        verts, faces, ids = copy.deepcopy(state)
+        faces.pop(fi)
+        for k in quad:
+            x, y, z = verts[k]
+            verts.append((x + (1.5 - x) * 0.2, y + (1.5 - y) * 0.2, z))  # 1.1, 1.2 ...: inexact in float32
+            ids.append(ids[k])
+            inner.append(len(verts) - 1)
+        faces.append(inner)
+        faces += [[quad[i], quad[(i + 1) % 4], inner[(i + 1) % 4], inner[i]] for i in range(4)]
+        dump = dump_of(verts, faces, ids)
+        base = merge3.strip(self.start)
+        committed, info = topo3.attach(base, dump, 2.0, 1)
+        self.assertTrue(info["topology_changed"])
+        again, info2 = topo3.attach(committed, dump, 3.0, 1)
+        self.assertEqual(topo3.get_ids(again).tolist(), topo3.get_ids(committed).tolist())
+        self.assertFalse(info2["topology_changed"])
+
+    def test_repair_recovers_ids_blender_rounded(self):
+        """Blender passes the id attribute through float32 in inset and poke, so
+        large ids of untouched vertices lose their low bits. Repair must give
+        them their ids back even where the vertex also moved."""
+        big = [(1 << 23) * 186 + k for k in range(1, 26)]
+        verts, faces = grid()
+        dump = dump_of(verts, faces, big)
+        base, _ = topo3.attach(None, dump, 1.0, 186)
+        rounded = [int(np.float32(i)) for i in big]
+        self.assertGreater(len(big) - len(set(rounded)), 10)
+        moved = list(verts)
+        moved[6] = (moved[6][0] + 0.01, moved[6][1], 0.0)
+        out, info = topo3.attach(base, dump_of(moved, faces, rounded), 2.0, 186)
+        self.assertEqual(topo3.get_ids(out).tolist(), big)
+        self.assertFalse(info["topology_changed"])
+
     def test_conflict_notice_names_both_users_once(self):
         a, b = named("alice", self.start), named("bob", self.start)
         self.edit(a, split_center, (1, 1))
