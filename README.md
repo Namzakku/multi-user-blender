@@ -2,7 +2,50 @@
 
 A test patch for the Blender Multi-User extension 0.8.2 (replication 0.10.3, Blender 5.2.2). It lets several users edit the same object at the same time. Each value goes to whoever wrote it last, and no one's edit silently overwrites someone else's. Tested 2026-10-29 and 2026-10-30 in cua Space `local:blender-agent-b`, with up to three Blender instances driven by a stress script.
 
-`patch/v2/` is the current version. `patch/v1/` is the earlier three-way merge, kept for reference. It loses edits with three clients.
+`patch/v3/` is the current version. It is v2 plus merging of concurrent topology edits on one mesh, see "v3: topology merge" below. `patch/v2/` is the per-value merge without it. `patch/v1/` is the earlier three-way merge, kept for reference. It loses edits with three clients.
+
+## v3: topology merge (2026-10-31)
+
+Design in [TOPOLOGY-DESIGN.md](TOPOLOGY-DESIGN.md). The standalone prototype it grew from is in [topology/](topology/README.md).
+
+| File (in `patch/v3/`) | What it is |
+|---|---|
+| `topo3.py` | New module in `replication/`. Permanent vertex ids, the topology table, its merge, conflict view and canonical rebuild |
+| `merge3.py` | v2's merge3 with the topo3 hooks: `lww` hands two meshes with tables to topo3, `stamp_commit` and `merge_fetched` attach the table to each fresh dump |
+| `bl_mesh.patch` | `multi_user/bl_types/bl_mesh.py`: also send the `mu_vid` attribute. The installed file has CRLF line endings, so `install.sh` applies it with sed |
+| `install.sh` | Installs v3 over v2 in a Space and backs up what it replaces to `~/own/v2-installed/` |
+| `test_v3_sim.py` | Offline simulation of commits, server merges in several orders and client applies, using the real merge3 and topo3. No Blender |
+| `stress.py`, `check_topo.py` | v2's harness plus the `topo` and `topoclash` scenarios, which use real Edit Mode operators |
+
+The v2 patches (`porcelain`, `repository`, `interface`, `net`, `handlers`, `timers`) are unchanged and still needed.
+
+How it works. Each vertex has a permanent id in the integer attribute `mu_vid`. Each mesh node carries a table of every vertex, face and loose edge that has existed, by id, with an alive flag, a stamp and the commit that last changed it. Deletions stay as tombstones. Two tables merge entry by entry, newest stamp first, so the server and every client reach the same table in any order without knowing a common base. Each commit also records which commits it had seen. Two commits that had not seen each other and that touch the same base vertices conflict, and in that region the older one is hidden when the table is turned into a mesh. The next commit from any client makes that permanent. Vertex moves still merge per vertex, newest first. When the vertex layout changes, the mesh is rebuilt in one canonical order (ids ascending) with positions, UVs, seams and sharp edges carried by id.
+
+Blender copies an existing id onto each vertex an edit creates. Before each diff, duplicated ids are repaired: the copy nearest the id's old position keeps it, and the others take the id of a missing vertex at the same position or a fresh one (`client number << 23 | counter`, client number from the username).
+
+Results, Space B, three clients, `A_head` (482 vertices, 512 faces, with a UV map):
+
+| Test | Result |
+|---|---|
+| `test_v3_sim.py` | 13 of 13 pass |
+| topo: 60 s, agent0 extrudes, agent1 subdivides, agent2 insets faces in its own third of the head, plus object moves | Pass. All 30 topology edits present (611 vertices, 608 faces as expected), identical mesh by id, UVs and transform on all three, no conflicts |
+| topoclash: agent0 extrudes a +X face and a far -X face in one Edit Mode session, agent1 subdivides the same +X face 0.3 s later, agent2 insets a -Y face | Pass. One conflict, won by agent1. agent0's far extrude and agent2's inset kept (495 vertices, 523 faces, as expected). Identical on all three. The conflict was settled afterwards |
+| v2 scenarios rerun on v3: disjoint, undo and reconnect (90 s each), conflict, stale | Pass, same as v2. 0 of 482 vertices wrong on all three in disjoint, undo (34 undos) and reconnect. Conflict 2.222 at the midpoint and 4.444 at the end. Stale (0.5, 0.5, 2.05). No tracebacks |
+
+| GUI, two AI agents in Spaces A (host) and C, hand edits on `Shared_box`, a cube with a 4 by 4 grid per side (98 vertices, 96 faces). A extrudes a top center quad by 0.3. C, in one Edit Mode session, Knife-cuts a +X center quad and insets a -Y center quad by 0.1 | Pass. C was in Edit Mode while A's extrude arrived, so C's edits were made without it. Both Spaces ended at 108 vertices and 105 faces, the count with all three edits kept, with the same id hash, zmax 0.8 and no conflicts |
+
+v3 is installed in Spaces A, B and C. A three-agent GUI run on v3 was started on 2026-10-31 but stopped before it could be checked.
+
+The first topo run failed: every client numbered the mesh on its own, and those numberings counted as conflicting commits, so about 2,000 elements were hidden for a while and one edit was lost. The first numbering is now a shared baseline built from the synced mesh, which cannot conflict.
+
+v3 limits, in addition to v2's:
+
+- Vertex colors and other attributes (crease, bevel weight) switch the mesh back to v2's whole-mesh rule, because a rebuild would drop them. Shape keys and vertex groups are not part of the mesh dump and are not handled.
+- Two edits that share even one base vertex conflict, and the older one is dropped in that region, without a warning in the Blender UI. The add-on log has a `topo3:` line.
+- The table keeps tombstones and commit records for the whole session. It is never pruned.
+- Client numbers come from a hash of the username into 255 values, so two users can collide. Not detected.
+- The first edit on a client before any ids were loaded maps vertices by index, which is right when Blender appended the new vertices. After a deletion it falls back to matching positions.
+- Knife, connect-vertex-path and interactive loop cut have not been run through the harness. A three-agent GUI run has not been done on v3.
 
 ## Files (in `patch/v2/`)
 
