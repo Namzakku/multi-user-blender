@@ -11,11 +11,18 @@ at the end. MODE=extras, on the shared clock T0:
         skin radius 0.5, client at (0, 1, 0) with radius 0.9
   +60   the host applies Mods' modifiers one by one, 2 s apart
   +72   the client moves Mods, a later sync from the other user
-  +80   the host removes Doomed2 with bpy.data.objects.remove from a timer
+  +76   the client nudges Shared_box every 0.2 s for 10 s, so the host is
+        applying incoming updates while it removes objects
+  +80   the host removes Doomed2 (scene collection) and Doomed3 (child
+        collection Props) with bpy.data.objects.remove from a timer
   +90   both smooth one face of Shared_box's -x side at once, neighbours
   +125  last status line, then Blender quits
   Expected on both: Guides has a skin layer, radius 0.5 at (1, 0, 0) and 0.9
-  at (0, 1, 0); Mods has no modifiers; Doomed2 is gone; both faces smooth.
+  at (0, 1, 1); Mods has no modifiers; Doomed2 and Doomed3 are gone; both
+  faces smooth.
+  NO_SKIN=1 leaves Guides out (on mu4 its skin load ended the client's session
+  at +60, which hid the other checks). DEBUG=1 logs the skin rows Multi-User
+  holds for Guides.
 MODE=splitjoin, the planner's one-editor sequence of 2026-11-03:
   +50   the host separates the top centre faces of Shared_box into "part"
   +70   the host joins "part" back and merges the doubled seam vertices
@@ -23,6 +30,11 @@ MODE=splitjoin, the planner's one-editor sequence of 2026-11-03:
   +100  last status line, then Blender quits
   Expected on both: Shared_box's geometry hash equals the untouched box with
   CLIENT_OP applied (expected_meshes.py none <CLIENT_OP>).
+MODE=sequence: the host runs the mesh_ops edits in SEQ (comma separated) on
+  Shared_box at +50, +65, ...; CLIENT_OP (optional) runs at +57 on the client.
+  With SEQ=dissolve@top,merge_edge@side the merge keeps the face count after a
+  dissolve, which is what made mu4 put faces on the wrong vertices with one
+  editor. Expected: the third GEO of expected_meshes.py <SEQ op 1> <SEQ op 2>.
 """
 import json
 import os
@@ -39,6 +51,7 @@ ROLE, NAME, MODE = os.environ["ROLE"], os.environ["NAME"], os.environ.get("MODE"
 IP = os.environ.get("IP", "127.0.0.1")
 T0 = float(os.environ["T0"])
 END = 125 if MODE == "extras" else 100
+NO_SKIN = os.environ.get("NO_SKIN") == "1"  # leave out Guides (on mu4 its skin load ends the session)
 PKG = next((a for a in bpy.context.preferences.addons.keys() if a.endswith(".multi_user")),
            "bl_ext.user_default.multi_user")
 LOG = f"/tmp/mu5_{NAME}.log"
@@ -92,14 +105,23 @@ def start():
         at(8, make_objects)
         at(12, touch_objects)
     if MODE == "extras":
-        at(50, add_guide)
+        if not NO_SKIN:
+            at(50, add_guide)
         if ROLE == "host":
             for k in range(3):
                 at(60 + 2 * k, apply_first_modifier)
             at(80, remove_by_script)
         else:
             at(72, move_mods)
+            for k in range(50):  # incoming updates on the host while it removes objects
+                at(76 + 0.2 * k, nudge_box)
         at(90, smooth_one)
+    elif MODE == "sequence":
+        if ROLE == "host":
+            for i, op in enumerate(os.environ.get("SEQ", "").split(",")):
+                at(50 + 15 * i, lambda op=op: host_edit(op))
+        elif os.environ.get("CLIENT_OP", "none") != "none":
+            at(57, client_edit)
     else:
         if ROLE == "host":
             at(50, split_part)
@@ -113,14 +135,15 @@ def start():
 def make_objects():
     with ctx():
         mesh_ops.make_box("Shared_box")
-        if MODE == "extras":
+        if MODE == "extras" and not NO_SKIN:
             me = bpy.data.meshes.new("Guides")
-            me.from_pydata([(0.0, 0.0, 0.0)], [], [])
+            me.from_pydata([(0.0, 0.0, 0.0), (0.0, 0.0, 1.0)], [(0, 1)], [])
             o = bpy.data.objects.new("Guides", me)
             bpy.context.scene.collection.objects.link(o)
             o.location = (3.0, 0.0, 0.0)
             only(o)
             bpy.ops.object.modifier_add(type="SKIN")           # makes the skin layer, Object Mode
+        if MODE == "extras":
             bpy.ops.mesh.primitive_cube_add(size=0.5, location=(-3, 0, 1.0))
             mods = bpy.context.active_object
             mods.name = "Mods"
@@ -128,6 +151,11 @@ def make_objects():
                 mods.modifiers.new(kind.title(), kind)
             bpy.ops.mesh.primitive_cube_add(size=0.5, location=(2, 2, 1.0))
             bpy.context.active_object.name = "Doomed2"
+            props = bpy.data.collections.new("Props")
+            bpy.context.scene.collection.children.link(props)
+            me3 = bpy.data.meshes.new("Doomed3")
+            me3.from_pydata([(0, 0, 0), (0.3, 0, 0), (0, 0.3, 0)], [], [(0, 1, 2)])
+            props.objects.link(bpy.data.objects.new("Doomed3", me3))
     note({"made": sorted(o.name for o in bpy.data.objects)})
 
 
@@ -143,13 +171,14 @@ def add_guide():
     if o is None:
         note({"skipped": "no Guides"})
         return
-    pos, r = ((1.0, 0.0, 0.0), 0.5) if ROLE == "host" else ((0.0, 1.0, 0.0), 0.9)
+    # from different base vertices: one shared vertex would be a conflict by design
+    pos, r, src = ((1.0, 0.0, 0.0), 0.5, 0) if ROLE == "host" else ((0.0, 1.0, 1.0), 0.9, 1)
     with ctx():
         only(o)
         bpy.ops.object.mode_set(mode="EDIT")
         bm = bmesh.from_edit_mesh(o.data)
         bm.verts.ensure_lookup_table()
-        v0 = bm.verts[0]
+        v0 = next(v for v in bm.verts if abs(v.co.z - src) < 1e-4 and v.co.length < 1.01)
         nv = bm.verts.new(pos, v0)          # copies v0's data, as extrude does
         bm.edges.new((v0, nv))
         layer = bm.verts.layers.skin.verify()
@@ -178,11 +207,20 @@ def move_mods():
         note({"moved": "Mods", "modifiers": [m.name for m in o.modifiers]})
 
 
-def remove_by_script():
-    o = bpy.data.objects.get("Doomed2")
+def nudge_box():
+    o = bpy.data.objects.get("Shared_box")
     if o is not None:
-        bpy.data.objects.remove(o)
-        note({"removed": "Doomed2"})
+        o.location.y += 0.001
+
+
+def remove_by_script():
+    gone = []
+    for name in ("Doomed2", "Doomed3"):  # in the scene collection, and in a child collection
+        o = bpy.data.objects.get(name)
+        if o is not None:
+            bpy.data.objects.remove(o)
+            gone.append(name)
+    note({"removed": gone})
 
 
 def side_faces(me):
@@ -235,10 +273,33 @@ def join_part():
 
 
 def client_edit():
+    host_edit(os.environ["CLIENT_OP"])
+
+
+def host_edit(op):
     o = bpy.data.objects.get("Shared_box")
     with ctx():
-        chosen, r = mesh_ops.edit(o, os.environ["CLIENT_OP"])
-    note({"edit": os.environ["CLIENT_OP"], "faces": chosen, "result": str(r)})
+        chosen, r = mesh_ops.edit(o, op)
+    note({"edit": op, "faces": chosen, "result": str(r)})
+
+
+def skin_debug(me):
+    """DEBUG=1: the skin rows Multi-User holds for this mesh: the stored node
+    data and the merge base, as (vertex count, radius x per vertex)."""
+    import numpy as np
+    from replication import merge3
+    from replication.interface import session
+    out = {}
+    for uuid in list(session.repository.graph.keys()):
+        n = session.repository.graph.get(uuid)
+        if n.instance != me:
+            continue
+        for label, d in (("node", n.data), ("base", merge3._base.get(uuid))):
+            if isinstance(d, dict):
+                rows = np.frombuffer((d.get("mu_skin") or {}).get("data") or b"", dtype=np.float32).reshape(-1, 4)
+                out[label] = [d.get("vertex_count"), [round(float(r[0]), 3) for r in rows]]
+        out["state"] = str(n.state)
+    return out
 
 
 def status():
@@ -255,6 +316,8 @@ def status():
         if me.skin_vertices:
             info["radii"] = sorted([[round(c, 3) for c in v.co], round(s.radius[0], 3)]
                                    for v, s in zip(me.vertices, me.skin_vertices[0].data))
+        if os.environ.get("DEBUG"):
+            info["debug"] = skin_debug(me)
     m = bpy.data.objects.get("Mods")
     if m is not None:
         info["mods"] = [x.name for x in m.modifiers]

@@ -21,6 +21,17 @@ def _interior_edges(bm):
     return [e for e in bm.edges if len(e.link_faces) == 2 and all(f.select for f in e.link_faces)]
 
 
+def _merge_edge(bm):
+    """Merge the two vertices of the lowest inner edge of the selection at their
+    centre. The faces on that edge turn into triangles, so the face count stays."""
+    edges = _interior_edges(bm) or [e for e in bm.edges if all(v.select for v in e.verts)]
+    if not edges:
+        return None
+    key = lambda e: sorted(tuple(round(c, 4) for c in v.co) for v in e.verts)
+    a, b = min(edges, key=key).verts
+    return bmesh.ops.pointmerge(bm, verts=[a, b], merge_co=(a.co + b.co) / 2)
+
+
 OPS = {
     "poke": lambda bm: bpy.ops.mesh.poke(),
     "inset": lambda bm: bpy.ops.mesh.inset(thickness=0.05),
@@ -33,6 +44,7 @@ OPS = {
     "merge": lambda bm: bpy.ops.mesh.merge(type="CENTER"),
     "dissolve_edges": lambda bm: bmesh.ops.dissolve_edges(bm, edges=_interior_edges(bm), use_verts=True),
     "remove_doubles": lambda bm: bmesh.ops.remove_doubles(bm, verts=_verts(bm), dist=0.3),
+    "merge_edge": _merge_edge,
 }
 
 

@@ -31,6 +31,7 @@ from .bl_action import (
 )
 from .bl_datablock import get_datablock_from_uuid, resolve_datablock_from_uuid
 from .bl_material import IGNORED_SOCKETS
+from .bl_mesh import dump_skin, load_skin  # patched
 from .dump_anything import (Dumper, Loader, np_dump_collection,
                             np_load_collection)
 
@@ -635,11 +636,19 @@ class BlObject(ReplicatedDatablock):
         if hasattr(datablock, "cycles_visibility") and "cycles_visibility" in data:
             loader.load(datablock.cycles_visibility, data["cycles_visibility"])
 
+        # patched: skin vertices travel with the mesh (bl_mesh, keyed by vertex
+        # id); loaded here by index from the object dump they swapped radii
+        # between new vertices. Removing the last Skin modifier deletes the skin
+        # layer and adding one makes it again with default radii, so keep the
+        # mesh's rows across the modifier reload. The geometry does not change
+        # in between, so the rows still match the vertices.
+        skin = dump_skin(object_data) if isinstance(object_data, bpy.types.Mesh) else None
+
         if hasattr(datablock, "modifiers"):
             load_modifiers(data["modifiers"], datablock.modifiers)
 
-        # patched: skin vertices travel with the mesh (bl_mesh, keyed by vertex
-        # id). Loaded here by index, they swapped radii between new vertices.
+        if skin is not None and any(m.type == "SKIN" for m in datablock.modifiers):
+            load_skin(skin, object_data)
 
         constraints = data.get("constraints")
         if constraints:

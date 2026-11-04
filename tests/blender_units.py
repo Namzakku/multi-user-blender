@@ -97,6 +97,21 @@ def _():
     assert r == (0.7, 0.9), f"radius {r}"
 
 
+@check("skin radii survive reloading the object, which remakes its modifier stack")
+def _():
+    o = fresh_grid()
+    bpy.context.view_layer.objects.active = o
+    bpy.ops.object.modifier_add(type="SKIN")
+    o.data.skin_vertices[0].data[3].radius = (0.7, 0.9)
+    BlObject = importlib.import_module(f"{PKG}.bl_types.bl_object").BlObject
+    data = BlObject.dump(o)
+    data.pop("skin_vertices", None)    # the radii must come from the mesh, not the object dump
+    BlObject.load(data, o)
+    assert len(o.data.skin_vertices) == 1, "the skin layer is gone"
+    r = tuple(round(x, 4) for x in o.data.skin_vertices[0].data[3].radius)
+    assert r == (0.7, 0.9), f"radius {r}"
+
+
 @check("a file that does not exist is dumped without content and never raises")
 def _():
     missing = Path(tempfile.gettempdir()) / "mu_missing_dir" / "character_front.png"
