@@ -1,23 +1,64 @@
-"""The test box and the region edits shared by live_session.py and expected_meshes.py.
+"""The test box and the region edits shared by live_session.py, live_mu5.py and
+expected_meshes.py.
 
-Every edit selects the faces whose centre lies in the middle of the box top
-(the 2 by 2 block of the 4 by 4 grid, or whatever replaced it) and runs one
-Edit Mode operator on them.
+Every edit selects the faces of one region of the box and runs one Edit Mode
+step on them. An edit is named "<op>" or "<op>@<region>": op is a key of OPS,
+region a key of REGIONS (default "centre", the middle 2 by 2 faces of the top
+and of the bottom, as before mu5).
 """
+import hashlib
+import json
+
 import bmesh
 import bpy
 
+
+def _verts(bm):
+    return [v for v in bm.verts if v.select]
+
+
+def _interior_edges(bm):
+    return [e for e in bm.edges if len(e.link_faces) == 2 and all(f.select for f in e.link_faces)]
+
+
 OPS = {
-    "poke": lambda: bpy.ops.mesh.poke(),
-    "inset": lambda: bpy.ops.mesh.inset(thickness=0.05),
-    "bevel": lambda: bpy.ops.mesh.bevel(offset=0.05, segments=1, affect="EDGES"),
-    "extrude": lambda: bpy.ops.mesh.extrude_region_move(TRANSFORM_OT_translate={"value": (0.0, 0.0, 0.1)}),
+    "poke": lambda bm: bpy.ops.mesh.poke(),
+    "inset": lambda bm: bpy.ops.mesh.inset(thickness=0.05),
+    "bevel": lambda bm: bpy.ops.mesh.bevel(offset=0.05, segments=1, affect="EDGES"),
+    "extrude": lambda bm: bpy.ops.mesh.extrude_region_move(TRANSFORM_OT_translate={"value": (0.0, 0.0, 0.1)}),
+    # delete-type steps (mu5)
+    "delete": lambda bm: bpy.ops.mesh.delete(type="FACE"),
+    "delete_verts": lambda bm: bpy.ops.mesh.delete(type="VERT"),
+    "dissolve": lambda bm: bpy.ops.mesh.dissolve_faces(),
+    "merge": lambda bm: bpy.ops.mesh.merge(type="CENTER"),
+    "dissolve_edges": lambda bm: bmesh.ops.dissolve_edges(bm, edges=_interior_edges(bm), use_verts=True),
+    "remove_doubles": lambda bm: bmesh.ops.remove_doubles(bm, verts=_verts(bm), dist=0.3),
 }
 
 
 def in_centre(face):
+    """The middle 2 by 2 faces of the box top (face centres are in local space)."""
     c = face.calc_center_median()
     return c.z > 0.49 and max(abs(c.x), abs(c.y)) < 0.26
+
+
+def _block(axis, sign):
+    """The middle 2 by 2 faces of one side of the box, in local space."""
+    def pick(face):
+        c = face.calc_center_median()
+        others = [abs(c[k]) for k in range(3) if k != axis]
+        return c[axis] * sign > 0.49 and max(others) < 0.26
+    return pick
+
+
+REGIONS = {"centre": in_centre, "top": _block(2, 1), "bottom": _block(2, -1),
+           "side": _block(0, 1), "back": _block(1, 1)}
+
+
+def parse(spec):
+    """'merge@top' -> ('merge', the top region's pick)."""
+    op, _, region = spec.partition("@")
+    return op, REGIONS[region or "centre"]
 
 
 def make_box(name="Shared_box"):
@@ -33,8 +74,11 @@ def make_box(name="Shared_box"):
 
 
 def edit(o, op, pick=in_centre):
-    """Select the faces pick accepts on object o and run OPS[op]. Needs a context
-    with a 3D view (or background mode). Returns (faces selected, result)."""
+    """Select the faces pick accepts on object o and run OPS[op]. op may also be
+    "<op>@<region>". Needs a context with a 3D view (or background mode).
+    Returns (faces selected, result)."""
+    if "@" in op:
+        op, pick = parse(op)
     for x in bpy.context.view_layer.objects:
         x.select_set(False)
     o.select_set(True)
@@ -47,7 +91,22 @@ def edit(o, op, pick=in_centre):
     for f in chosen:
         f.select_set(True)
     bmesh.update_edit_mesh(o.data)
-    r = OPS[op]()
+    r = OPS[op](bm)
+    bmesh.update_edit_mesh(o.data)
     bpy.ops.object.mode_set(mode="OBJECT")
     o.select_set(False)
     return len(chosen), r
+
+
+def geo_hash(me):
+    """The mesh without ids: vertex positions and every face as the rotated list
+    of its corner positions, rounded to 1e-4. Equal on two Blenders only if each
+    face sits on the same points in the same winding."""
+    r = lambda p: [round(c, 4) + 0.0 for c in p]
+    verts = sorted(r(v.co) for v in me.vertices)
+    faces = []
+    for p in me.polygons:
+        pts = [r(me.vertices[i].co) for i in p.vertices]
+        k = pts.index(min(pts))
+        faces.append(pts[k:] + pts[:k])
+    return hashlib.md5(json.dumps([verts, sorted(faces)]).encode()).hexdigest()[:10]

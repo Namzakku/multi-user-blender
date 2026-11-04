@@ -2,8 +2,9 @@
 # Repeat the live same-region clash in two Spaces until the final mesh is wrong.
 # Run from Git Bash on the Docker host:
 #   sh tests/live_trials.sh <host space> <client space> <trials> [host delay] [host op] [client op]
-# Ops are the keys of mesh_ops.OPS (poke, inset, bevel, extrude); defaults poke
-# and inset. Each trial restarts both Blenders, runs live_session.py to +70 s
+# Ops are mesh_ops names: a key of mesh_ops.OPS (poke, inset, bevel, extrude,
+# delete, dissolve, merge, ...), optionally with a region (delete@top,
+# poke@side); defaults poke and inset. Without Docker access use live_loop.sh. Each trial restarts both Blenders, runs live_session.py to +70 s
 # and prints both final meshes. A trial passes when both Blenders hold the same
 # mesh by id and it has the size of one of the correct results that
 # expected_meshes.py computes: the host's edit alone, the client's alone, or

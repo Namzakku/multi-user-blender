@@ -5,7 +5,7 @@ How to build a cua Space that runs Blender with the patched Multi-User add-on (v
 ## What you get
 
 - Blender 5.2.2 in `/opt/blender`, on the path as `blender`
-- The patched Multi-User from `addon/` (upstream 0.8.2 with the v2 and v3 patches applied), built by `build.py` and installed for the user `cua` as `multi_user 0.8.2+mu4`: per-value merging, and topology merging by permanent vertex id (see [README.md](README.md))
+- The patched Multi-User from `addon/` (upstream 0.8.2 with the v2 and v3 patches applied), built by `build.py` and installed for the user `cua` as `multi_user 0.8.2+mu5`: per-value merging, and topology merging by permanent vertex id (see [README.md](README.md))
 - `~/mu/gui_session.py` to host or join a session, and `~/stress/` with the stress harness
 
 ## 1. Create the Space
@@ -74,4 +74,17 @@ For same-region clashes between two Spaces, run from the Docker host (Git Bash):
 sh tests/live_trials.sh <host space> <client space> 5 0 bevel extrude
 ```
 
-It restarts both Blenders per trial and stops at the first wrong or diverged mesh. For conflict notices, deletion and pruning, run `~/mu/live_session.py` in two Spaces with the same `T0` (a Unix time about 20 s ahead), `ROLE=host NAME=alice` in one and `ROLE=client NAME=bob IP=<host ip>` in the other, the same way as `gui_session.py` above. It takes about 6 minutes and logs to `/tmp/live_<NAME>.log`. Its docstring lists what to expect at each step.
+It restarts both Blenders per trial and stops at the first wrong or diverged mesh.
+
+Without Docker access, drive the same trials with the cua MCP tool `space_bash` (as the user `cua`). Start `~/mu/live_loop.sh` in both Spaces with one base time, about a minute ahead, and the same `PAIRS`:
+
+```sh
+# host Space
+nohup sh ~/mu/live_loop.sh host <base> 6 ~/res.txt "PAIRS=delete@top:poke@side merge@top:inset@side" > /tmp/loop.log 2>&1 &
+# client Space
+nohup sh ~/mu/live_loop.sh client <base> 6 ~/res.txt "PAIRS=delete@top:poke@side merge@top:inset@side" IP=<host ip> > /tmp/loop.log 2>&1 &
+# about 100 s per trial later, copy the client's ~/res.txt to the host (cua download and upload), then
+python3 ~/mu/live_check.py ~/res.txt ~/res_client.txt
+```
+
+`blender -b --python ~/mu/blender_units.py` checks the Blender side of the add-on (refused and restored loads, skin layer, missing files). `~/mu/live_mu5.py` runs the live checks for skin, applied modifiers, script deletion and face flags (`MODE=extras`) or the one-editor separate and join sequence (`MODE=splitjoin`); its docstring lists what to expect. For conflict notices, deletion and pruning, run `~/mu/live_session.py` in two Spaces with the same `T0` (a Unix time about 20 s ahead), `ROLE=host NAME=alice` in one and `ROLE=client NAME=bob IP=<host ip>` in the other, the same way as `gui_session.py` above. It takes about 6 minutes and logs to `/tmp/live_<NAME>.log`. Its docstring lists what to expect at each step.

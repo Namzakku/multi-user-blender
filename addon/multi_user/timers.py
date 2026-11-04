@@ -136,6 +136,43 @@ def remove_deleted():
     pending[:] = keep
 
 
+_removing = set()  # objects this Blender already asked the server to delete
+
+
+def remove_lost_objects():
+    """patched: an object removed by a script (bpy.data.objects.remove) tags no
+    scene or collection update, so on_scene_update never purged its node and the
+    other Blenders kept the object. Find object nodes whose datablock is gone
+    here and delete them for everyone, as deleting in the UI does."""
+    from replication.constants import UP
+    repo = session.repository
+    gone = []
+    for node in repo.graph.values():
+        if node.uuid in _removing or node.state != UP or node.instance is None \
+                or not isinstance(node.data, dict) or node.data.get("type_id") != "Object":
+            continue
+        try:
+            node.instance.name  # a removed object raises ReferenceError
+            continue
+        except ReferenceError:
+            pass
+        found = repo.rdp.resolve(node.data)  # after an undo the object has a new pointer
+        if found is not None:
+            node.instance = found
+            continue
+        gone.append(node.uuid)
+    for uuid in gone:
+        _removing.add(uuid)
+        try:
+            porcelain.rm(repo, uuid, remove_dependencies=False)
+            logging.info(f"Object {uuid} was removed here, deleting it for everyone")
+        except NonAuthorizedOperationError as e:
+            logging.warning(f"Cannot delete {uuid} for everyone: {e}")
+        except Exception:
+            logging.error(f"Fail to delete removed object {uuid}")
+            traceback.print_exc()
+
+
 _notices_shown = 0
 
 
@@ -164,6 +201,7 @@ def show_notices():
 class ApplyTimer(Timer):
     def execute(self):
         if session and session.state == STATE_ACTIVE:
+            remove_lost_objects()
             remove_deleted()
             show_notices()
             for node in session.repository.graph.keys():

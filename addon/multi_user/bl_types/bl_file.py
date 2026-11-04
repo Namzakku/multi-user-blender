@@ -79,17 +79,14 @@ class BlFile(ReplicatedDatablock):
             'name': datablock.name,
         }
 
-        logging.info(f"Reading {datablock.name} content: {datablock.stat().st_size} bytes")
-
+        # patched: a missing file (an image path into another machine's cache)
+        # raised FileNotFoundError from stat() here and ended the session
         try:
-            file = open(datablock, "rb")
-            data['file'] = file.read()
-
-            file.close()
-        except IOError:
-            logging.warning(f"{datablock} doesn't exist, skipping")
-        else:
-            file.close()
+            with open(datablock, "rb") as file:
+                data['file'] = file.read()
+            logging.info(f"Read {datablock.name}: {len(data['file'])} bytes")
+        except OSError as e:
+            logging.warning(f"Cannot read {datablock} ({e}), sending it without content")
 
         return data
 
@@ -98,17 +95,17 @@ class BlFile(ReplicatedDatablock):
         """
         Writing the file
         """
-
+        if 'file' not in data:
+            logging.warning(f"No content received for {datablock}, skipping")
+            return
         try:
-            file = open(datablock, "wb")
-            file.write(data['file'])
+            with open(datablock, "wb") as file:
+                file.write(data['file'])
 
             if get_preferences().clear_memory_filecache:
                 del data["file"]
-        except IOError:
-            logging.warning(f"{datablock} doesn't exist, skipping")
-        else:
-            file.close()
+        except OSError as e:
+            logging.warning(f"Cannot write {datablock} ({e}), skipping")
 
     @staticmethod
     def resolve_deps(datablock: object) -> list[object]:
@@ -125,8 +122,14 @@ class BlFile(ReplicatedDatablock):
             if not data:
                 return True
 
+            # patched: a missing file has nothing new to send
+            try:
+                disk_size = datablock.stat().st_size
+            except OSError:
+                return False
+            if 'file' not in data:
+                return True
             memory_size = sys.getsizeof(data['file'])-33
-            disk_size = datablock.stat().st_size
 
             if memory_size != disk_size:
                 return True

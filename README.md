@@ -5,14 +5,15 @@ A patched build of the Blender Multi-User extension 0.8.2 (replication 0.10.3, B
 ## Install
 
 - In a cua Space: follow [SETUP.md](SETUP.md), which runs `setup.sh`.
-- Anywhere else: `python3 build.py` packs `addon/` into `dist/multi_user-0.8.2+mu4.zip`. Install it with Edit > Preferences > Get Extensions > Install from Disk, or `blender -c extension install-file -r user_default -e <zip>`. Remove the upstream Multi-User first, since both use the id `multi_user`.
+- Anywhere else: `python3 build.py` packs `addon/` into `dist/multi_user-0.8.2+mu5.zip`. Install it with Edit > Preferences > Get Extensions > Install from Disk, or `blender -c extension install-file -r user_default -e <zip>`. Remove the upstream Multi-User first, since both use the id `multi_user`.
+- Upgrading from mu4: mu5 sends skin data with the mesh and keeps face flags in the topology table, so every Blender in a session, and the server the host runs, must run the same version. Save the host's file in Object Mode, stop the session, install the zip in every Blender, restart Blender (an enabled extension keeps its old modules loaded) and host the saved file again.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `addon/multi_user/`, `addon/replication/` | The add-on and the library it bundles, with every change applied. In the history, one commit adds upstream unmodified and the next applies the v2 and v3 patches, so its diff is the change against upstream |
-| `build.py` | Packs `addon/` into an installable zip. replication goes in as a `0.10.3+mu4` wheel so Blender does not keep an upstream copy |
+| `build.py` | Packs `addon/` into an installable zip. replication goes in as a `0.10.3+mu5` wheel so Blender does not keep an upstream copy |
 | `setup.sh`, `SETUP.md` | Build a test Space from scratch |
 | `tests/` | Offline simulation, race fuzzer and live two-Space tests (see "Tests") |
 | `patch/v1`, `v2`, `v3` | Earlier versions as patches against upstream, with the stress harness in `patch/v3/` |
@@ -20,11 +21,15 @@ A patched build of the Blender Multi-User extension 0.8.2 (replication 0.10.3, B
 
 ## How it works
 
-**Values.** Every node's data carries a stamp tree under `_mu_ts`: one time per scalar, per list element and per 4-byte word of a buffer such as vertex coordinates. A commit stamps only what changed and sends the whole node. The server and every client merge value by value, newest stamp first, so all reach the same data in any order. Stamps use `time.time()`, so machines need synced clocks.
+**Values.** Every node's data carries a stamp tree under `_mu_ts`: one time per scalar, per list element and per 4-byte word of a buffer such as vertex coordinates. A commit stamps only what changed and sends the whole node. The server and every client merge value by value, newest stamp first, so all reach the same data in any order. An emptied list or buffer gets one stamp of its own, the time it became empty, so applying the last modifier wins over an older copy that still has it. Stamps use `time.time()`, so machines need synced clocks.
 
-**Stale restores.** Blender's move tool and undo write back a state captured earlier, which can overwrite another user's newer value. Each client keeps the values incoming updates replaced (the last 64 per node). A commit that sets a value back to one of them keeps the synced value instead. Undoing your own edit still works.
+**Stale restores.** Blender's move tool and undo write back a state captured earlier, which can overwrite another user's newer value. Each client keeps the values incoming updates replaced (the last 64 per node). A commit that sets a value back to one of them keeps the synced value instead. Undoing your own edit still works. In a mesh only vertex positions are checked, matched by vertex id after id repair. Counts, faces, edges, ids, UVs and skin data are never put back: after a topology change the same index is another element.
 
-**Topology.** Each vertex has a permanent id in the integer attribute `mu_vid`. Each mesh node carries a table of every vertex, face and loose edge that ever existed, with an alive flag, a stamp and the commit that last changed it. Tables merge entry by entry, newest first. Each commit records which commits it had seen. Two commits that had not seen each other and touch the same base vertices conflict: the older one is hidden in that region, and the next commit from any client (a settle commit) makes that permanent. After a topology change the mesh is rebuilt in id order, with positions, UVs, seams and sharp edges carried by id.
+**Topology.** Each vertex has a permanent id in the integer attribute `mu_vid`. Each mesh node carries a table of every vertex, face and loose edge that ever existed, with an alive flag, a stamp and the commit that last changed it. Tables merge entry by entry, newest first. Each commit records which commits it had seen. Two commits that had not seen each other and touch the same base vertices conflict: the older one is hidden in that region, and the next commit from any client (a settle commit) makes that permanent. After a topology change the mesh is rebuilt in id order, with positions, UVs, Skin modifier data, seams and sharp edges carried by id.
+
+**Face flags.** A change of smooth shading or material index on an existing face is a table entry of its own (section `p`) with its own stamp. It is an edit only where the flag differs from what that Blender last loaded, it never brings back a deleted face, and every merge takes the flags from the table, also when it keeps one side's face buffers whole.
+
+**Whole loads.** A mesh update whose counts do not match its buffers is never loaded. merge3 rebuilds it from the topology table, or keeps what Blender holds. `bl_mesh.load` checks again and refuses such an update before touching the mesh, and a load that fails partway puts the mesh back as it was.
 
 **Id repair.** Blender copies an existing id onto each vertex an edit creates, and its inset and poke pass the attribute through float32, so ids above 2**24 lose their low bits even on vertices the edit did not touch. Before each diff, `repair_ids` makes ids unique again and gives the same answer every time it runs on the same mesh: a vertex keeps or recovers its id by position, then by float32 rounding, and only then gets a fresh id (`client number << 23 | counter`).
 
@@ -32,7 +37,9 @@ A patched build of the Blender Multi-User extension 0.8.2 (replication 0.10.3, B
 
 **Conflict notices.** When an edit is dropped, every Blender shows a popup and a red box at the top of the Multi-User panel, naming the object, both users and the number of dropped elements. Settle commits record what they settled, so a Blender that never saw the conflict open still reports it.
 
-**Deleting objects.** The deleting Blender marks the delete as real (`client:deleted`), and the others remove their copy too. An object in Edit Mode is removed when its user leaves Edit Mode. "Stop tracking" removes nothing.
+**Deleting objects.** The deleting Blender marks the delete as real (`client:deleted`), and the others remove their copy too. An object in Edit Mode is removed when its user leaves Edit Mode. "Stop tracking" removes nothing. An object removed by a script (`bpy.data.objects.remove`) tags no scene update, so the apply timer also looks for object nodes whose object is gone and deletes them the same way.
+
+**Missing files.** An image whose file is missing (for example a path into another machine's Multi-User cache) syncs without its pixels. Before mu5 reading the file raised `FileNotFoundError` and ended the session.
 
 **Pruning.** A commit every active client has seen, at least 120 s older than the newest commit, is dropped from the table with the tombstones it left, unless that would change the mesh. The decision uses only the table, so every replica prunes alike.
 

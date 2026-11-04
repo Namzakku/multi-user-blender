@@ -34,8 +34,6 @@ from .bl_material import IGNORED_SOCKETS
 from .dump_anything import (Dumper, Loader, np_dump_collection,
                             np_load_collection)
 
-SKIN_DATA = ["radius", "use_loose", "use_root"]
-
 SHAPEKEY_BLOCK_ATTR = [
     "mute",
     "value",
@@ -551,12 +549,16 @@ class BlObject(ReplicatedDatablock):
         data_id = data.get("data")
         data_type = data.get("type")
 
-        object_data = get_datablock_from_uuid(
-            data_uuid, find_data_from_name(data_id), ignore=["images"]
-        )  # TODO: use resolve_from_id
-
-        if data_type != "EMPTY" and object_data is None:
-            raise Exception(f"Fail to load object {data['name']})")
+        if data_type == "EMPTY":
+            # An image empty dumps its image as `data`, and the name lookup below would
+            # return it, but objects.new() refuses an image. load() assigns it afterwards.
+            object_data = None
+        else:
+            object_data = get_datablock_from_uuid(
+                data_uuid, find_data_from_name(data_id), ignore=["images"]
+            )  # TODO: use resolve_from_id
+            if object_data is None:
+                raise Exception(f"Fail to load object {data['name']})")
 
         return bpy.data.objects.new(object_name, object_data)
 
@@ -636,15 +638,8 @@ class BlObject(ReplicatedDatablock):
         if hasattr(datablock, "modifiers"):
             load_modifiers(data["modifiers"], datablock.modifiers)
 
-        if (
-            hasattr(object_data, "skin_vertices")
-            and object_data.skin_vertices
-            and "skin_vertices" in data
-        ):
-            for index, skin_data in enumerate(object_data.skin_vertices):
-                np_load_collection(
-                    data["skin_vertices"][index], skin_data.data, SKIN_DATA
-                )
+        # patched: skin vertices travel with the mesh (bl_mesh, keyed by vertex
+        # id). Loaded here by index, they swapped radii between new vertices.
 
         constraints = data.get("constraints")
         if constraints:
@@ -790,12 +785,7 @@ class BlObject(ReplicatedDatablock):
         if hasattr(object_data, "shape_keys") and object_data.shape_keys:
             data["shape_keys"] = dump_shape_keys(object_data.shape_keys)
 
-        #  SKIN VERTICES
-        if hasattr(object_data, "skin_vertices") and object_data.skin_vertices:
-            skin_vertices = list()
-            for skin_data in object_data.skin_vertices:
-                skin_vertices.append(np_dump_collection(skin_data.data, SKIN_DATA))
-            data["skin_vertices"] = skin_vertices
+        # SKIN VERTICES: patched, dumped with the mesh (bl_mesh.dump_skin)
 
         # CYCLE SETTINGS
         if hasattr(datablock, "cycles_visibility"):

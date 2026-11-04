@@ -14,7 +14,9 @@ import zlib
 
 import numpy as np
 
-HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "addon", "replication")
+# MU_SRC=<folder with merge3.py and topo3.py> runs the tests on other code, for
+# example the previous release, to show which tests fail there.
+HERE = os.environ.get("MU_SRC") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "addon", "replication")
 PKG = tempfile.mkdtemp()
 os.makedirs(os.path.join(PKG, "replication"))
 open(os.path.join(PKG, "replication", "__init__.py"), "w").close()
@@ -124,6 +126,230 @@ def move(state, vid, pos):
     verts, faces, ids = copy.deepcopy(state)
     verts[ids.index(vid)] = pos
     return verts, faces, ids
+
+
+# Delete-type edits. Blender keeps the order of the elements that stay and
+# renumbers them; a face that an operator creates goes last.
+def _compact(verts, faces, ids, dead):
+    index, nv, nids = {}, [], []
+    for i, (p, vid) in enumerate(zip(verts, ids)):
+        if i not in dead:
+            index[i] = len(nv)
+            nv.append(p)
+            nids.append(vid)
+    return nv, [[index[v] for v in f] for f in faces], nids
+
+
+def delete_faces(state, fis):
+    """Delete > Faces: the faces go, and every vertex that only they used."""
+    verts, faces, ids = copy.deepcopy(state)
+    gone = set(fis)
+    rest = [f for i, f in enumerate(faces) if i not in gone]
+    used = {v for f in rest for v in f}
+    dead = {v for i in gone for v in faces[i]} - used
+    return _compact(verts, rest, ids, dead)
+
+
+def delete_vert(state, vi):
+    """Delete > Vertices: the vertex goes with every face around it."""
+    verts, faces, ids = copy.deepcopy(state)
+    rest = [f for f in faces if vi not in f]
+    return _compact(verts, rest, ids, {vi})
+
+
+def dissolve(state, fi, fj):
+    """Dissolve Edges on an edge two faces share: one polygon replaces them.
+    Faces that share several edges dissolve the one with the lowest points."""
+    verts, faces, ids = copy.deepcopy(state)
+    f, g = faces[fi], faces[fj]
+    shared = [(f[k], f[(k + 1) % len(f)]) for k in range(len(f))
+              if f[k] in g and g[(g.index(f[k]) - 1) % len(g)] == f[(k + 1) % len(f)]]
+    if not shared:
+        raise ValueError("faces share no edge")
+    a, b = min(shared, key=lambda e: sorted([tuple(verts[e[0]]), tuple(verts[e[1]])]))
+    fr = f[f.index(b):] + f[:f.index(b)]          # b ... a
+    gr = g[g.index(a):] + g[:g.index(a)]          # a ... b
+    joined = fr + gr[1:-1]
+    rest = [x for i, x in enumerate(faces) if i not in (fi, fj)]
+    return verts, rest + [joined], ids
+
+
+def merge_verts(state, va, vb, interp_id=False):
+    """Merge > At Center: vb joins va at their midpoint. With interp_id the kept
+    vertex gets the average id rounded through float32, as Blender interpolates
+    an integer attribute; otherwise it keeps its own id."""
+    verts, faces, ids = copy.deepcopy(state)
+    verts[va] = tuple((verts[va][k] + verts[vb][k]) / 2 for k in range(3))
+    if interp_id:
+        ids[va] = int(round(float(np.float32(ids[va]) * np.float32(0.5) + np.float32(ids[vb]) * np.float32(0.5))))
+    out = []
+    for f in faces:
+        g = [va if v == vb else v for v in f]
+        g = [v for k, v in enumerate(g) if v != g[k - 1]]
+        if len(set(g)) >= 3:
+            out.append(g)
+    return _compact(verts, out, ids, {vb})
+
+
+# ---------------------------------------------------------------- what Blender holds
+class LoadError(Exception):
+    """What Blender raises (or crashes on) for a dump whose parts disagree."""
+
+
+def check_dump(d):
+    """Raise LoadError when bl_mesh.load would fail: counts that do not match
+    the buffers ("Array length mismatch"), or indices out of range."""
+    d = topo3.drop(merge3.strip(d))
+    nv, ne, nl, np_ = d["vertex_count"], d["egdes_count"], d["loop_count"], d["poly_count"]
+    sizes = [(d["vertices"]["co"], nv * 12), (d["edges"]["vertices"], ne * 8),
+             (d["loops"]["vertex_index"], nl * 4), (d["polygons"]["loop_start"], np_ * 4),
+             (d["polygons"]["loop_total"], np_ * 4)]
+    for entry in d.get("attributes") or []:
+        sizes.append((entry[3]["value"], nv * 4))
+    for buf, want in sizes:
+        if len(buf) != want:
+            raise LoadError(f"Array length mismatch (expected {want // 4}, got {len(buf) // 4})")
+    vi = np.frombuffer(d["loops"]["vertex_index"], dtype=np.int32)
+    lt = np.frombuffer(d["polygons"]["loop_total"], dtype=np.int32)
+    ls = np.frombuffer(d["polygons"]["loop_start"], dtype=np.int32)
+    if int(lt.sum()) != nl or (len(ls) and (ls.min() < 0 or (ls + lt).max() > nl)):
+        raise LoadError("loops do not match the polygons")
+    if len(vi) and (vi.min() < 0 or vi.max() >= nv):
+        raise LoadError("a loop points past the vertices")
+
+
+def strict_load(d):
+    check_dump(d)
+    return load(d)
+
+
+def geometry(state):
+    """The mesh without ids: sorted vertex positions and faces as rotated
+    tuples of positions, so two meshes compare equal only if every face sits on
+    the same points in the same winding."""
+    verts, faces, _ = state
+    r = lambda p: tuple(round(float(c), 4) for c in p)
+    out = []
+    for f in faces:
+        pts = [r(verts[v]) for v in f]
+        k = pts.index(min(pts))
+        out.append(tuple(pts[k:] + pts[:k]))
+    return sorted(r(p) for p in verts), sorted(out)
+
+
+class Clock:
+    now = 0.0
+
+    def time(self):
+        return Clock.now
+
+
+_peer_modules = {}
+
+
+def fresh_modules(tag):
+    """merge3 and topo3 keep module state, so every peer gets its own copy."""
+    pkg = f"rep_{tag}"
+    os.makedirs(os.path.join(PKG, pkg), exist_ok=True)
+    open(os.path.join(PKG, pkg, "__init__.py"), "w").close()
+    for name in ("merge3.py", "topo3.py"):
+        shutil.copy(os.path.join(HERE, name), os.path.join(PKG, pkg, name))
+    for mod in [m for m in sys.modules if m == pkg or m.startswith(pkg + ".")]:
+        del sys.modules[mod]
+    import importlib
+    m3 = importlib.import_module(f"{pkg}.merge3")
+    m3.time = Clock()
+    return m3
+
+
+class InEditMode(Exception):
+    """bl_mesh.dump and bl_mesh.load raise ContextError while in Edit Mode."""
+
+
+class Peer:
+    """One Blender running the real hooks in the order porcelain calls them:
+    stamp_commit on commit, merge_incoming on receive, merge_fetched before a
+    load. The datablock is `state`; loading checks the dump as Blender would."""
+
+    def __init__(self, name, synced, tag=None, dump=None):
+        self.name = name
+        self.m3 = fresh_modules(tag or name)
+        self.m3.topo3._username = name
+        self.node = type("Node", (), {})()
+        self.node.uuid, self.node.instance, self.node.state = "mesh", object(), "UP"
+        self.node.data = copy.deepcopy(synced)
+        self.m3.remember(self.node.uuid, self.node.data)
+        self.edit_mode = False
+        self.rdp = self
+        self._dump = dump or (lambda state: dump_of(*state))
+        self.smooth = self.skin = None
+        self._load(synced)
+
+    def _load(self, d):
+        """What bl_mesh.load leaves: the mesh, its face smooth flags and its skin rows."""
+        self.state = strict_load(d)
+        d = topo3.drop(merge3.strip(d))
+        self.smooth = list(np.frombuffer(d["polygons"].get("use_smooth") or b"", dtype=bool))
+        skin = (d.get("mu_skin") or {}).get("data")
+        self.skin = np.frombuffer(skin, dtype=np.float32).reshape(-1, 4).copy() if skin else None
+
+    def dump(self, instance=None, stamp_uuid=None):
+        if self.edit_mode:
+            raise InEditMode()
+        d = self._dump(self.state)
+        if self.smooth is not None and len(self.smooth) == len(self.state[1]):
+            d["polygons"]["use_smooth"] = np.array(self.smooth, dtype=bool).tobytes()
+        if self.skin is not None and len(self.skin) == len(self.state[0]):
+            d["mu_skin"] = {"data": np.asarray(self.skin, dtype=np.float32).tobytes()}
+        return d
+
+    def radii(self):
+        """Skin radius x by rounded vertex position, None when the skin rows do
+        not match the vertices."""
+        if self.skin is None or len(self.skin) != len(self.state[0]):
+            return None
+        return {tuple(round(c, 4) for c in p): round(float(r[0]), 4) for p, r in zip(self.state[0], self.skin)}
+
+    def smooth_faces(self):
+        """Rounded corner points of the smooth faces."""
+        g = geometry((self.state[0], [f for f, s in zip(self.state[1], self.smooth) if s], None))
+        return g[1]
+
+    def commit(self):
+        """porcelain.commit and push. Returns the data sent, or None."""
+        if self.node.state != "UP" or self.edit_mode:
+            return None
+        new = self.m3.stamp_commit(self.node, self.dump())
+        if self.m3._eq(new, self.node.data):
+            self.m3._commit_base.pop(self.node.uuid, None)
+            return None
+        self.node.data = new
+        self.m3.after_commit(self.node.uuid, self.node.data)
+        self.node.state = self.m3.state_after_push(self.node.uuid, "UP", "FETCHED")
+        return copy.deepcopy(self.node.data)
+
+    def receive(self, data):
+        self.node.data = self.m3.merge_incoming(self.node.data, data)
+        self.node.state = "FETCHED"
+
+    def apply(self):
+        """porcelain.apply. Returns the data a published merge sent, or None.
+        Raises InEditMode, or LoadError where Blender would fail."""
+        if self.node.state != "FETCHED":
+            return None
+        to_load, contributed = self.m3.merge_fetched(self, self.node)
+        if self.edit_mode:
+            raise InEditMode()
+        self._load(to_load)
+        self.node.state = "UP"
+        last = self.m3._last_merge.pop(self.node.uuid, None)
+        if last is not None:
+            self.m3.remember_merged(self.node.uuid, last[0], last[1], contributed)
+        else:
+            self.m3.remember(self.node.uuid, self.node.data)
+        if contributed and self.m3.PUBLISH_MERGES:
+            return self.commit()
+        return None
 
 
 # ---------------------------------------------------------------- the protocol
@@ -571,6 +797,239 @@ class ImprovementTests(unittest.TestCase):
         text = merge3.NOTICES[0][1]
         self.assertIn("alice and bob", text)
         self.assertIn("Kept bob's edit", text)
+
+
+def consistent(d):
+    try:
+        check_dump(d)
+        return True
+    except LoadError:
+        return False
+
+
+class DeleteRaceTests(unittest.TestCase):
+    """mu5: delete-type edits racing an update for another part of the mesh."""
+
+    def setUp(self):
+        Clock.now = 1.0
+        self.start = host_start((*grid(), None))
+        self.tags = iter(range(10 ** 6))
+
+    def peer(self, name, synced=None):
+        return Peer(name, self.start if synced is None else synced, tag=f"{name}{next(self.tags)}_{id(self)}")
+
+    def at(self, t):
+        Clock.now = t
+
+    def face(self, p, quad):
+        v, f, ids = p.state
+        return find_face(v, f, ids, Q(*quad))
+
+    def test_count_seen_before_never_reaches_a_load(self):
+        """Bob splits a quad (16 to 17 faces) and Alice applies it, so her
+        16-face dump is remembered as superseded. She then deletes a face far
+        away (17 to 16). The stale-restore check took her new face count for a
+        stale one and put 17 back over buffers of 16 faces: Blender's
+        "Array length mismatch (expected 697, got 693)" and a crash."""
+        alice, bob = self.peer("alice"), self.peer("bob")
+        self.at(2.0)
+        bob.state = split_diagonal(bob.state, self.face(bob, (3, 3)))
+        ub = bob.commit()
+        self.at(2.5)
+        alice.receive(ub)
+        alice.apply()
+        self.assertEqual(len(alice.state[1]), 17)
+        self.at(3.0)
+        alice.state = delete_faces(alice.state, [self.face(alice, (0, 0))])
+        expected = geometry(alice.state)
+        ua = alice.commit()
+        self.assertTrue(consistent(ua), "the commit carries counts that do not match its buffers")
+        self.at(3.2)
+        again = alice.apply()          # mu4: LoadError, Array length mismatch (expected 17, got 16)
+        self.assertTrue(consistent(alice.m3._base["mesh"]), "the base does not match its buffers")
+        self.at(3.5)
+        bob.receive(ua)
+        bob.apply()
+        for extra in [again] if again else []:
+            bob.receive(extra)
+            bob.apply()
+        self.assertEqual(geometry(alice.state), expected)
+        self.assertEqual(geometry(bob.state), expected)
+
+    def test_dissolve_then_merge_keeps_faces_on_their_vertices(self):
+        """One editor, the other Blender idle. A dissolve puts the joined face
+        last; the reapply loads the rebuild, which sorts faces by key, and
+        remembers Blender's order as superseded. A merge then keeps the face
+        count, so the stale-restore check compared the face buffers index by
+        index and put old loop starts back: faces on the wrong vertices."""
+        start = host_start((*grid(9), None))
+        alice, idle = self.peer("alice", start), self.peer("idle", start)
+        self.at(11.0)
+        f, g = (find_face(*alice.state, corner_ids(9)(x, 1)) for x in (1, 2))
+        alice.state = dissolve(alice.state, f, g)
+        idle.receive(alice.commit())
+        self.at(11.5)
+        alice.apply()
+        idle.apply()
+        self.at(12.0)
+        v, faces, ids = alice.state
+        a, b = ids.index(1 + 2 + 2 * 10), ids.index(1 + 2 + 3 * 10)      # points (2, 2) and (2, 3)
+        alice.state = merge_verts(alice.state, a, b)
+        expected = geometry(alice.state)
+        sent = alice.commit()
+        self.assertEqual(geometry(load(sent)), expected, "the commit moved faces onto other vertices")
+        self.at(12.5)
+        alice.apply()
+        idle.receive(sent)
+        idle.apply()
+        self.assertEqual(geometry(alice.state), expected)
+        self.assertEqual(geometry(idle.state), expected)
+
+
+def exchange(peers, server, t, rounds=3):
+    """Every peer commits, the server merges, every other peer receives and
+    applies, repeated. Returns the time reached."""
+    for _ in range(rounds):
+        for p in peers:
+            Clock.now = t = t + 0.1
+            sent = p.commit()
+            while sent is not None:
+                server.store(sent)
+                for q in peers:
+                    if q is not p:
+                        q.receive(sent)
+                Clock.now = t = t + 0.1
+                sent = p.apply()
+        for q in peers:
+            Clock.now = t = t + 0.1
+            extra = q.apply()
+            if extra is not None:
+                for r in peers:
+                    if r is not q:
+                        r.receive(extra)
+                server.store(extra)
+    return t
+
+
+class Server:
+    def __init__(self, data, tag):
+        self.m3 = fresh_modules(tag)
+        self.data = copy.deepcopy(data)
+
+    def store(self, update):
+        self.data = self.m3.merge_incoming(self.data, update)
+        return self
+
+
+class Mu5Tests(unittest.TestCase):
+    """mu5: skin by vertex id, emptied lists, per-face flags."""
+
+    def setUp(self):
+        Clock.now = 1.0
+        self.n = 0
+
+    def tag(self, name):
+        self.n += 1
+        return f"{name}{self.n}_{id(self)}"
+
+    def test_face_flags_set_at_once_keep_both(self):
+        """Alice smooths one face and Bob the next one at the same moment. Face
+        flags were merged as buffers that stamp four faces per word, so one
+        side's word replaced the other's: an edit was lost, and the face flipped
+        between smooth and flat as each Blender wrote back what it loaded."""
+        start = host_start((*grid(), None))
+        alice, bob = Peer("alice", start, self.tag("a")), Peer("bob", start, self.tag("b"))
+        server = Server(start, self.tag("s"))
+        for p, quad in ((alice, (0, 0)), (bob, (1, 0))):
+            v, f, ids = p.state
+            p.smooth[find_face(v, f, ids, Q(*quad))] = True
+        Clock.now = 2.0
+        ua = alice.commit()
+        Clock.now = 2.05
+        ub = bob.commit()
+        server.store(ua).store(ub)
+        alice.receive(ub)
+        bob.receive(ua)
+        Clock.now = 2.3
+        for p in (alice, bob):
+            extra = p.apply()
+            if extra is not None:
+                server.store(extra)
+                (bob if p is alice else alice).receive(extra)
+        t = exchange([alice, bob], server, 3.0)
+        want = sorted(geometry((alice.state[0], [alice.state[1][find_face(*alice.state, Q(*q))]
+                                                for q in ((0, 0), (1, 0))], None))[1])
+        self.assertEqual(alice.smooth_faces(), want)
+        self.assertEqual(bob.smooth_faces(), want)
+        exchange([alice, bob], server, t)              # nothing changes on later syncs
+        self.assertEqual(alice.smooth_faces(), want)
+        self.assertEqual(bob.smooth_faces(), want)
+
+    def test_skin_radii_follow_vertex_ids(self):
+        """Alice and Bob each add a guide vertex at the same moment, with
+        different skin radii. Index-matched skin data swapped the two radii."""
+        verts, faces = grid()
+        d = dump_of(verts, faces, None)
+        d["mu_skin"] = {"data": np.tile(np.array([0.25, 0.25, 0, 0], dtype=np.float32), len(verts)).tobytes()}
+        start, _ = topo3.attach(None, d, 1.0, 9)
+        start[S] = merge3.stamp(merge3._MISSING, None, merge3.strip(start), 1.0)
+        alice, bob = Peer("alice", start, self.tag("a")), Peer("bob", start, self.tag("b"))
+        server = Server(start, self.tag("s"))
+        for p, corner, pos, r in ((alice, 0, (0.5, -1.0, 0.0), 0.5), (bob, 3, (3.5, -1.0, 0.0), 0.9)):
+            v, f, ids = p.state
+            v.append(pos)
+            ids.append(ids[corner])           # Blender copies the id of the vertex it came from
+            f.append([corner, len(v) - 1, corner + 1])
+            p.smooth.append(False)
+            p.skin = np.vstack([p.skin, [r, r, 0, 0]])
+        Clock.now = 2.0
+        ua = alice.commit()
+        Clock.now = 2.05
+        ub = bob.commit()
+        server.store(ua).store(ub)
+        alice.receive(ub)
+        bob.receive(ua)
+        Clock.now = 2.3
+        for p in (alice, bob):
+            extra = p.apply()
+            if extra is not None:
+                server.store(extra)
+                (bob if p is alice else alice).receive(extra)
+        exchange([alice, bob], server, 3.0)
+        for p in (alice, bob):
+            radii = p.radii()
+            self.assertIsNotNone(radii, f"{p.name}: skin rows do not match the vertices")
+            self.assertEqual(radii[(0.5, -1.0, 0.0)], 0.5, p.name)
+            self.assertEqual(radii[(3.5, -1.0, 0.0)], 0.9, p.name)
+            self.assertEqual({r for k, r in radii.items() if k[1] >= 0}, {0.25}, p.name)
+
+    def test_applied_modifiers_stay_gone(self):
+        """X applies Mirror, Skin and Subdivision, one commit each. Y applied the
+        first two updates, then moves the object. An emptied list had no stamps,
+        counted as time 0, and Y's older [Subdivision] put the modifier back."""
+        m = merge3
+        mods = [{"name": "Mirror", "type": "MIRROR"}, {"name": "Skin", "type": "SKIN"},
+                {"name": "Subdivision", "type": "SUBSURF"}]
+        x = {"name": "body", "modifiers": mods, "location": [0.0, 0.0, 0.0]}
+        xts = m.stamp(m._MISSING, None, x, 1.0)
+        seen = None
+        for k, t in ((1, 2.0), (2, 3.0), (3, 4.0)):
+            new = dict(x, modifiers=mods[k:])
+            xts, x = m.stamp(x, xts, new, t), new
+            if k == 2:
+                seen = (copy.deepcopy(x), copy.deepcopy(xts))   # what Y holds
+        y, yts = seen
+        moved = dict(y, location=[1.0, 0.0, 0.0])
+        yts, y = m.stamp(y, yts, moved, 5.0), moved
+        for a, ats, b, bts in ((x, xts, y, yts), (y, yts, x, xts)):
+            out, _ = m.lww(a, ats, b, bts)
+            self.assertEqual(out["modifiers"], [])
+            self.assertEqual(out["location"], [1.0, 0.0, 0.0])
+        stored = dict(x)
+        stored[S] = xts
+        update = dict(y)
+        update[S] = yts
+        self.assertEqual(m.merge_incoming(stored, update)["modifiers"], [])
 
 
 if __name__ == "__main__":

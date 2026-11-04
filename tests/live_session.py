@@ -6,7 +6,9 @@ ROLE=host|client NAME=<user> IP=<host ip> T0=<shared epoch seconds>
 Both run the same schedule on the shared clock T0:
   +50   both edit the centre of the box top at once (host HOST_OP, default
         poke; client CLIENT_OP, default inset; see mesh_ops.OPS), a conflict:
-        each Blender should show a notice naming the other user
+        each Blender should show a notice naming the other user. An op may
+        name a region ("delete@top", "poke@side", see mesh_ops.REGIONS) or
+        be "none"; edits on separate regions must both be kept
   +90   the host deletes the object "Doomed"; it should vanish on the client
   +200  the client edits the +x side, after it has seen the host's edit
   +330  the host edits the bottom; the settled commits should be pruned
@@ -80,8 +82,9 @@ def start():
     else:
         at(200, lambda: edit(lambda f: f.calc_center_median().x > 0.49, "poke"))
     op = os.environ.get("HOST_OP", "poke") if ROLE == "host" else os.environ.get("CLIENT_OP", "inset")
-    at(50 + float(os.environ.get("HOST_DELAY", "0")) * (ROLE == "host"),
-       lambda: edit(mesh_ops.in_centre, op))
+    if op != "none":
+        at(50 + float(os.environ.get("HOST_DELAY", "0")) * (ROLE == "host"),
+           lambda: edit(None, op))
     bpy.app.timers.register(status, first_interval=5)
     return None
 
@@ -109,7 +112,7 @@ def edit(pick, op):
         note({"edit_skipped": "no Shared_box"})
         return None
     with ctx():
-        chosen, r = mesh_ops.edit(o, op, pick)
+        chosen, r = mesh_ops.edit(o, op, pick or mesh_ops.in_centre)
     note({"edit": op, "faces": chosen, "result": str(r)})
     return None
 
@@ -145,7 +148,7 @@ def status():
                 k = f.index(min(f))
                 faces.append(f[k:] + f[:k])
             info["id_hash"] = hashlib.md5(json.dumps([verts, sorted(faces)]).encode()).hexdigest()[:10]
-        info.update({"verts": len(me.vertices), "faces": len(me.polygons)})
+        info.update({"verts": len(me.vertices), "faces": len(me.polygons), "geo": mesh_ops.geo_hash(me)})
         try:
             from replication.interface import session
             from replication import merge3, topo3

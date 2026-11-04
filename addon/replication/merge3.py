@@ -124,6 +124,14 @@ def stamp(prev, prev_ts, new, now):
         pd = prev if isinstance(prev, dict) else {}
         return {k: stamp(pd.get(k, _MISSING), _child(prev_ts, k) if pd else None, v, now)
                 for k, v in new.items() if k != STAMP_KEY and k != TOPO_KEY}
+    if isinstance(new, (list, tuple, bytes, bytearray)) and len(new) == 0:
+        # An empty container has no elements to carry stamps, and a stamp tree of
+        # [] counts as time 0, so emptying a list (applying the last modifier)
+        # lost to any older non-empty copy and the modifier came back. Give it
+        # one stamp of its own: the time it became empty.
+        if isinstance(prev, type(new)) and len(prev) == 0:
+            return float(prev_ts) if isinstance(prev_ts, (int, float)) else _tmax(prev_ts)
+        return now
     if isinstance(new, (list, tuple)):
         same = isinstance(prev, (list, tuple)) and len(prev) == len(new)
         out = []
@@ -164,6 +172,8 @@ def unstale(base, new, olds):
     if isinstance(new, dict):
         if not isinstance(base, dict):
             return new, False
+        if topo3.is_mesh(new) and topo3.is_mesh(base):
+            return topo3.unstale_mesh(base, new, olds, unstale)  # by vertex id, never by index
         out = None
         for k, v in new.items():
             if k == STAMP_KEY or k == TOPO_KEY or k not in base:
@@ -291,6 +301,9 @@ def stamp_commit(node, new_version):
         prev_ts = stamps_of(old) if old else None
     if prev is not _MISSING:
         fixed, changed = unstale(prev, strip(new_version), _superseded.get(node.uuid))
+        if changed and topo3.check(fixed) and not topo3.check(new_version):
+            logging.error(f"merge3: a stale-restore fix broke {node.uuid}; committing the dump as is")
+            changed = False
         if changed:
             logging.info(f"merge3: ignored a stale restore in {node.uuid}")
             new_version = dict(fixed)
@@ -346,12 +359,15 @@ def merge_fetched(repository, node):
         return topo3.drop(strip(remote)), False
     base = _base.get(node.uuid)
     if base is None:
-        return topo3.drop(strip(remote)), False
+        return topo3.drop(whole(strip(remote), node.uuid)), False
     try:
         local = repository.rdp.dump(node.instance, stamp_uuid=node.uuid)
     except Exception as e:  # e.g. mesh in edit mode: let apply raise and retry later
         logging.debug(f"merge3: dump failed for {node.uuid}: {e}")
-        return topo3.drop(strip(remote)), False
+        return topo3.drop(whole(strip(remote), node.uuid)), False
+    if topo3.check(local) is None and topo3.check(strip(base)) is not None:
+        logging.warning(f"merge3: the base of {node.uuid} does not match its counts, using what Blender holds")
+        base = local
     dumped = local
     local, _ = unstale(strip(base), local, _superseded.get(node.uuid))
     now = time.time()
@@ -363,10 +379,18 @@ def merge_fetched(repository, node):
         rts = stamp(_MISSING, None, strip(remote), now)
     topo3.LAST = None
     merged, mts = lww(local, lts, strip(remote), rts)
+    problem = topo3.check(merged)
+    if problem:
+        # Never hand Blender a mesh whose parts disagree: a load fails halfway
+        # and the half-loaded mesh crashes it. Rebuild from the table, which is
+        # whole by construction, or keep what Blender holds.
+        logging.error(f"merge3: merged {node.uuid} does not match its counts ({problem}); resyncing")
+        merged, mts = resync(merged, mts, local, lts)
     if topo3.LAST is not None:
         _notice_clashes(_label(node), *topo3.LAST)
     if not _eq(topo3.drop(merged), dumped):
-        note_superseded(node.uuid, dumped, topo3.drop(merged))
+        # with the repaired ids, so a later stale-restore check matches by vertex id
+        note_superseded(node.uuid, topo3.with_ids(dumped, local), topo3.drop(merged))
     kept = not _eq(merged, strip(remote))
     if kept:
         logging.info(f"merge3: kept newer local values in {node.uuid}")
@@ -379,6 +403,40 @@ def merge_fetched(repository, node):
 
 
 _last_merge = {}
+
+
+def resync(merged, mts, local, lts):
+    """A mesh whose counts match its buffers in place of `merged`: rebuilt from
+    merged's topology table, positions taken by id from whichever dumps are
+    whole, else the local dump, which is what Blender holds already."""
+    topo = merged.get(TOPO_KEY) if isinstance(merged, dict) else None
+    if topo:
+        geom, co_ts = topo3.rebuild(topo3.view(topo), [(merged, mts), (local, lts)])
+        out = {k: x for k, x in merged.items() if k not in topo3.GEOM_KEYS}
+        out.update(geom)
+        ot = {k: x for k, x in mts.items() if k not in topo3.GEOM_KEYS} if isinstance(mts, dict) else {}
+        t = _tmax(mts)
+        for k in geom:
+            ot[k] = t
+        ot["vertices"] = {"co": co_ts}
+        if topo3.check(out) is None:
+            return out, ot
+    return local, lts
+
+
+def whole(data, uuid=""):
+    """data, or a rebuild of it from its table when its counts do not match its
+    buffers. Raises ValueError when neither is possible, so the apply fails
+    before Blender's mesh is touched and the next update tries again."""
+    problem = topo3.check(data)
+    if not problem:
+        return data
+    logging.error(f"merge3: update for {uuid} does not match its counts ({problem})")
+    if isinstance(data, dict) and data.get(TOPO_KEY):
+        fixed, _ = resync(data, {}, data, {})
+        if topo3.check(fixed) is None:
+            return fixed
+    raise ValueError(f"mesh update for {uuid} does not match its counts: {problem}")
 
 
 def _label(node):
@@ -439,5 +497,11 @@ def merge_incoming(old, new):
     except Exception as e:
         logging.warning(f"merge3: incoming merge failed, keeping update as is: {e}")
         return new
+    problem = topo3.check(merged)
+    if problem:
+        logging.error(f"merge3: stored merge does not match its counts ({problem}); resyncing")
+        merged, mts = resync(merged, mts, strip(old), ots)
+        if topo3.check(merged) and not topo3.check(strip(new)):
+            return new
     merged[STAMP_KEY] = mts
     return merged

@@ -6,6 +6,9 @@ and loose edge that has ever existed, keyed by permanent ids:
     "v": {"<vid>": [alive, stamp, cid, x, y, z]}
     "f": {"<vid>,<vid>,...": [alive, stamp, cid, use_smooth, material_index]}
     "e": {"<vid>,<vid>": [alive, stamp, cid]}           loose edges only
+    "p": {"<vid>,<vid>,...": [stamp, use_smooth, material_index]}
+         face flags changed after the face was made; the newer of this and
+         the "f" entry wins, and a flag change never revives a deleted face
     "c": {cid: [client, stamp, {"<client>": newest stamp of that client seen}]}
          a settle commit adds 1 and [[winner cid, loser cids, hidden, winner, losers]]
     "n": {"<client>": [username, stamp]}        who holds each client number
@@ -51,7 +54,11 @@ MAX_CLIENT = 255
 PRUNE_SETTLE = 120.0
 PRUNE_AGE = 600.0
 GEOM_KEYS = ("vertex_count", "vertices", "egdes_count", "edges", "loop_count", "loops",
-             "poly_count", "polygons", "attributes", "uv_layers", "vertex_colors")
+             "poly_count", "polygons", "attributes", "uv_layers", "vertex_colors", "mu_skin")
+# Skin modifier data per vertex, dumped by bl_mesh as float32 rows
+# [radius x, radius y, use_loose, use_root] and carried by vertex id.
+SKIN_KEY = "mu_skin"
+SKIN_DEFAULT = (0.25, 0.25, 0.0, 0.0)
 _username = None
 # Set by merge_mesh: the view and table of the last merge, for conflict notices.
 LAST = None
@@ -268,6 +275,183 @@ def _set_ids(d, ids):
     d["attributes"] = attrs
 
 
+_DOMAIN = {"POINT": "vertex_count", "EDGE": "egdes_count", "FACE": "poly_count", "CORNER": "loop_count"}
+
+
+def check(d):
+    """Why bl_mesh.load would fail on this dump, or None when it is whole.
+
+    A count that does not match its buffer makes Blender raise "Array length
+    mismatch" halfway through a load, and the half-loaded mesh then crashed
+    Blender (2026-11-04). So does a loop or edge that points past the vertices."""
+    if not is_mesh(d):
+        return None
+    try:
+        nv, ne, nl, nf = (int(d[k]) for k in ("vertex_count", "egdes_count", "loop_count", "poly_count"))
+        need = [("vertices.co", (d["vertices"] or {}).get("co"), nv * 12),
+                ("edges.vertices", (d.get("edges") or {}).get("vertices"), ne * 8),
+                ("edges.use_seam", (d.get("edges") or {}).get("use_seam"), ne),
+                ("edges.use_edge_sharp", (d.get("edges") or {}).get("use_edge_sharp"), ne),
+                ("loops.vertex_index", (d["loops"] or {}).get("vertex_index"), nl * 4),
+                ("loops.normal", (d["loops"] or {}).get("normal"), nl * 12),
+                ("polygons.loop_start", (d["polygons"] or {}).get("loop_start"), nf * 4),
+                ("polygons.loop_total", (d["polygons"] or {}).get("loop_total"), nf * 4),
+                ("polygons.use_smooth", (d["polygons"] or {}).get("use_smooth"), nf),
+                ("polygons.material_index", (d["polygons"] or {}).get("material_index"), nf * 4)]
+        counts = {"vertex_count": nv, "egdes_count": ne, "poly_count": nf, "loop_count": nl}
+        for name, _type, domain, values in d.get("attributes") or []:
+            if domain in _DOMAIN and isinstance(values, dict):
+                need.append((f"attribute {name}", values.get("value"), counts[_DOMAIN[domain]] * 4))
+        for name, layer in (d.get("uv_layers") or {}).items():
+            need.append((f"uv layer {name}", (layer or {}).get("data"), nl * 8))
+        if SKIN_KEY in d:
+            need.append(("skin", (d[SKIN_KEY] or {}).get("data"), nv * 16))
+        for name, buf, size in need:
+            if buf and len(buf) != size:
+                return f"{name} holds {len(buf)} bytes, the counts need {size}"
+        if nv and not (d["vertices"] or {}).get("co"):
+            return "vertices without coordinates"
+        vi = _buf(d["loops"], "vertex_index", np.int32)
+        ls = _buf(d["polygons"], "loop_start", np.int32)
+        lt = _buf(d["polygons"], "loop_total", np.int32)
+        ev = _buf(d.get("edges"), "vertices", np.int32)
+        if len(vi) != nl or len(ls) != nf or len(lt) != nf:
+            return "loops or polygons missing"
+        if int(lt.sum()) != nl or (nf and (ls.min() < 0 or lt.min() < 3 or int((ls + lt).max()) > nl)):
+            return "polygons do not cover the loops"
+        if (nl and (vi.min() < 0 or vi.max() >= nv)) or (len(ev) and (ev.min() < 0 or ev.max() >= nv)):
+            return "a loop or edge points past the vertices"
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        return f"unreadable mesh dump ({e!r})"
+    return None
+
+
+def _ids_matching(d):
+    """The dump's ids when there is one per vertex, else None."""
+    ids = get_ids(d)
+    if ids is None or len(ids) != len(_buf(d["vertices"], "co", np.float32, 3)):
+        return None
+    return ids
+
+
+def _same_topology(a, b):
+    for sec, key in (("loops", "vertex_index"), ("polygons", "loop_start"), ("polygons", "loop_total"),
+                     ("edges", "vertices")):
+        if (a.get(sec) or {}).get(key) != (b.get(sec) or {}).get(key):
+            return False
+    return len(_buf(a["vertices"], "co", np.float32, 3)) == len(_buf(b["vertices"], "co", np.float32, 3))
+
+
+def unstale_mesh(base, new, olds, generic):
+    """merge3.unstale for a mesh dump. Returns (new', changed).
+
+    The geometry is never compared index by index: counts, faces, edges, ids,
+    UVs and skin stay as the dump has them. A topology change is a real edit,
+    which the table merges, and after a topology change the same index is a
+    different vertex or face (2026-11-04: a reverted face count crashed the
+    load, and reverted loop starts put faces on the wrong vertices). Only a
+    vertex coordinate goes back to its synced value, matched by vertex id, where
+    an update replaced exactly that value of that vertex. Meshes without ids are
+    matched by index only while every dump involved has the same topology. The
+    rest of the dump goes through `generic`, the plain merge3.unstale."""
+    rest = lambda d: {k: v for k, v in d.items() if k not in GEOM_KEYS} if isinstance(d, dict) else d
+    out, changed = generic(rest(base), rest(new), [(rest(b), rest(a)) for b, a in olds])
+    co, co_changed = _unstale_co(base, new, olds)
+    if not changed and not co_changed:
+        return new, False
+    result = dict(new)
+    result.update(out)
+    if co_changed:
+        result["vertices"] = dict(new["vertices"])
+        result["vertices"]["co"] = co
+    return result, True
+
+
+def _words_by_id(d, ids):
+    """Coordinate words of d and {id: index} for the ids that occur once."""
+    words = np.frombuffer((d["vertices"] or {}).get("co") or b"", dtype=np.uint32).reshape(-1, 3)
+    seen = {}
+    for i, v in enumerate(ids):
+        seen[int(v)] = -1 if int(v) in seen else i
+    return words, {v: i for v, i in seen.items() if i >= 0}
+
+
+def matching_ids(d, base):
+    """The ids repair_ids gives d against base's table, for matching vertices by
+    id before the commit repairs them. A fresh dump still carries the ids Blender
+    copied onto new vertices and rounded through float32, which name other
+    vertices. Fresh ids come out unused by the base, so they match nothing."""
+    ids = _ids_matching(d)
+    topo = base.get(TOPO_KEY) if isinstance(base, dict) else None
+    if ids is None or not topo:
+        return ids
+    co = _buf(d["vertices"], "co", np.float32, 3)
+    fixed, n = repair_ids(ids, [tuple(c) for c in co], _alive_verts(topo), 0)
+    return np.asarray(fixed, dtype=np.int64) if n else ids
+
+
+def with_ids(d, ids_from):
+    """d with the ids of ids_from, a dump of the same vertices in the same order."""
+    ids = _ids_matching(ids_from)
+    if not is_mesh(d) or ids is None or len(ids) != len(_buf(d["vertices"], "co", np.float32, 3)):
+        return d
+    d = dict(d)
+    _set_ids(d, ids)
+    return d
+
+
+def _unstale_co(base, new, olds):
+    if check(base) or check(new):
+        return None, False
+    nid, bid = matching_ids(new, base), _ids_matching(base)
+    if nid is None or bid is None:
+        if not _same_topology(base, new):
+            return None, False
+        nid = bid = np.arange(len(_buf(new["vertices"], "co", np.float32, 3)))
+        by_index = True
+    else:
+        by_index = False
+    nw, _ = _words_by_id(new, nid)
+    bw, bmap = _words_by_id(base, bid)
+    rows = [(i, bmap[int(v)]) for i, v in enumerate(nid) if int(v) in bmap]
+    if not rows:
+        return None, False
+    ni = np.array([r[0] for r in rows])
+    bi = np.array([r[1] for r in rows])
+    differs = nw[ni] != bw[bi]
+    if not differs.any():
+        return None, False
+    mask = np.zeros_like(differs)
+    for b, a in olds or []:
+        if not (is_mesh(b) and is_mesh(a)) or check(b) or check(a):
+            continue
+        if by_index:
+            if not (_same_topology(b, new) and _same_topology(a, new)):
+                continue
+            ids_b = ids_a = nid
+        else:
+            ids_b, ids_a = _ids_matching(b), _ids_matching(a)
+            if ids_b is None or ids_a is None:
+                continue
+        bwo, bomap = _words_by_id(b, ids_b)
+        awo, aomap = _words_by_id(a, ids_a)
+        sel = [(r, bomap[int(nid[i])], aomap[int(nid[i])]) for r, i in enumerate(ni)
+               if int(nid[i]) in bomap and int(nid[i]) in aomap]
+        if not sel:
+            continue
+        r = np.array([s[0] for s in sel])
+        before, after = bwo[[s[1] for s in sel]], awo[[s[2] for s in sel]]
+        mask[r] |= (before == nw[ni[r]]) & (before != after)
+    mask &= differs
+    if not mask.any():
+        return None, False
+    out = nw.copy()
+    picked = out[ni]
+    picked[mask] = bw[bi][mask]
+    out[ni] = picked
+    return out.tobytes(), True
+
+
 # ---------------------------------------------------------------- table
 def _ids_or_index(d):
     """A dump's ids, or 1..N by index when it has none (the shared first numbering)."""
@@ -345,11 +529,15 @@ def attach(base, dump, now, client=None, name=None):
         _set_ids(dump, fixed)
     mesh = decode(dump, fixed)
 
-    # Last synced positions, kept in a tombstone so a hidden deletion can be undone.
+    # Last synced positions, kept in a tombstone so a hidden deletion can be undone,
+    # and the synced face flags, so only a flag the user changed here is an edit.
     last = {}
+    synced_faces = None
     if synced is not None and len(synced_ids) == len(_buf(synced["vertices"], "co", np.float32, 3)):
         base_co = _buf(synced["vertices"], "co", np.float32, 3)
         last = {int(synced_ids[i]): [float(c) for c in base_co[i]] for i in range(len(base_co))}
+        if check(synced) is None:
+            synced_faces = decode(synced, synced_ids)["faces"]
 
     # A commit whose mesh is the table's view, while that view hides a conflict,
     # only writes down how the conflict was resolved. Every client that applies
@@ -383,8 +571,16 @@ def attach(base, dump, now, client=None, name=None):
         if e is None or not e[0]:
             tf[ks] = [1, now, cid, smooth, mat]
             changed = True
-        elif (bool(e[3]), int(e[4])) != (smooth, mat):
-            tf[ks] = [1, now, e[2], smooth, mat]  # a flag change keeps the face's owner
+        else:
+            # A flag change goes to "p" with its own stamp. It is an edit only where
+            # the flag differs from what this Blender last loaded: a flag the table
+            # already changed, and the load has not shown yet, is not one. Writing
+            # it into the face entry would also revive a face deleted at once.
+            was = synced_faces.get(key) if synced_faces is not None else None
+            if was is None:
+                was = face_flags(topo, ks, e)
+            if was != (smooth, mat):
+                topo.setdefault("p", {})[ks] = [now, smooth, mat]
     for ks, e in tf.items():
         if e[0] and kparse(ks) not in mesh["faces"]:
             tf[ks] = [0, now, cid, e[3], e[4]]
@@ -430,6 +626,12 @@ def merge_topo(ta, tb):
     c = dict(ta.get("c", {}))
     c.update(tb.get("c", {}))
     out["c"] = c
+    flags = dict(ta.get("p") or {})
+    for k, e in (tb.get("p") or {}).items():
+        if k not in flags or (e[0], repr(e)) > (flags[k][0], repr(flags[k])):
+            flags[k] = e
+    if flags:
+        out["p"] = flags
     reg = dict(ta.get("n") or {})
     for no, entry in (tb.get("n") or {}).items():
         mine = reg.get(no)
@@ -477,7 +679,18 @@ def prune(topo):
     out["s"] = pruned
     for sec in ("v", "f", "e"):
         out[sec] = {k: e for k, e in topo.get(sec, {}).items() if e[0] or e[2] in out["c"]}
+    if topo.get("p"):
+        # a flag entry outlives neither its face nor a newer face entry
+        out["p"] = {k: e for k, e in topo["p"].items() if k in out["f"] and e[0] >= out["f"][k][1]}
     return out
+
+
+def face_flags(topo, ks, e):
+    """(use_smooth, material_index) of face entry e: from "p" when that is newer."""
+    p = (topo.get("p") or {}).get(ks)
+    if p is not None and p[0] >= e[1]:
+        return bool(p[1]), int(p[2])
+    return bool(e[3]), int(e[4])
 
 
 def same_mesh(x, y):
@@ -594,7 +807,7 @@ def view(topo):
     for k, e in topo.get("f", {}).items():
         key = kparse(k)
         if alive("f", k, e) and all(v in verts for v in key):
-            faces[key] = (bool(e[3]), int(e[4]))
+            faces[key] = face_flags(topo, k, e)
     edges = set()
     for k, e in topo.get("e", {}).items():
         key = kparse(k)
@@ -621,16 +834,25 @@ def rebuild(v, sources):
     from .merge3 import _tmax
     pos, pos_t, flags = {}, {}, {}
     uvs, uv_t = {}, {}   # layer -> face key -> corner uvs, and the stamp they came with
+    skin, skin_t, has_skin = {}, {}, False
     for d, ts in sources:
-        ids = get_ids(d)
-        if ids is None:
-            continue
+        ids = _ids_matching(d)
+        if ids is None or check(d) is not None:
+            continue  # a dump whose parts disagree would put values on the wrong ids
         co = _buf(d["vertices"], "co", np.float32, 3)
         vts = _vertex_stamps(d, ts)
         for i, vid in enumerate(ids):
             vid = int(vid)
             if vid in v["verts"] and (vid not in pos_t or vts[i] > pos_t[vid]):
                 pos[vid], pos_t[vid] = co[i], float(vts[i])
+        if d.get(SKIN_KEY):
+            has_skin = True
+            rows = _buf(d[SKIN_KEY], "data", np.float32, 4)
+            sts = _row_stamps(_child_ts(ts, SKIN_KEY), "data", len(rows), 4)
+            for i, vid in enumerate(ids):
+                vid = int(vid)
+                if vid in v["verts"] and (vid not in skin_t or sts[i] > skin_t[vid]):
+                    skin[vid], skin_t[vid] = rows[i], float(sts[i])
         m = decode(d, ids)
         flags.update(m["flags"])
         lts = ts.get("uv_layers") if isinstance(ts, dict) else ts
@@ -692,6 +914,9 @@ def rebuild(v, sources):
                     if vid in corners:
                         out[ls[p] + k] = corners[vid]
             data["uv_layers"][name] = {"data": out.tobytes()}
+    if has_skin:
+        data[SKIN_KEY] = {"data": np.array([skin.get(vid, SKIN_DEFAULT) for vid in order],
+                                           dtype=np.float32).reshape(-1, 4).tobytes()}
     return data, co_ts.tobytes()
 
 
@@ -699,6 +924,46 @@ def _child_ts(ts, key):
     if isinstance(ts, dict):
         return ts.get(key)
     return ts
+
+
+def _row_stamps(ts, key, n, width):
+    """Per-row stamp of a buffer of n rows of `width` words: the newest word."""
+    t = _child_ts(ts, key)
+    if isinstance(t, (bytes, bytearray)) and len(t) == n * width * 8:
+        return np.frombuffer(t, dtype=np.float64).reshape(-1, width).max(axis=1)
+    from .merge3 import _tmax
+    return np.full(n, _tmax(t))
+
+
+def _flags_from_view(d, v):
+    """d with each face's use_smooth and material_index taken from view v, so a
+    merge that kept one side's face buffers still shows the table's flags. The
+    buffers stamp four faces per word; per-face flags live in the table."""
+    ids = _ids_matching(d)
+    if ids is None or check(d) is not None:
+        return d
+    vi = _buf(d["loops"], "vertex_index", np.int32)
+    ls = _buf(d["polygons"], "loop_start", np.int32)
+    lt = _buf(d["polygons"], "loop_total", np.int32)
+    smooth = _buf(d["polygons"], "use_smooth", bool).copy()
+    mat = _buf(d["polygons"], "material_index", np.int32).copy()
+    if len(smooth) != len(ls):
+        smooth = np.zeros(len(ls), dtype=bool)
+    if len(mat) != len(ls):
+        mat = np.zeros(len(ls), dtype=np.int32)
+    changed = False
+    for p in range(len(ls)):
+        want = v["faces"].get(face_key(ids[j] for j in vi[ls[p]:ls[p] + lt[p]]))
+        if want is not None and (bool(smooth[p]), int(mat[p])) != want:
+            smooth[p], mat[p] = want
+            changed = True
+    if not changed:
+        return d
+    d = dict(d)
+    d["polygons"] = dict(d["polygons"])
+    d["polygons"]["use_smooth"] = smooth.tobytes()
+    d["polygons"]["material_index"] = mat.tobytes()
+    return d
 
 
 def fix_co_stamps(base, base_ts, new, ts, now):
@@ -766,8 +1031,13 @@ def merge_mesh(a, ats, b, bts, lww):
     LAST = (v, topo)
     ra = {k: x for k, x in a.items() if k != TOPO_KEY}
     rb = {k: x for k, x in b.items() if k != TOPO_KEY}
-    if _same_layout(a, b) and matches_view(a, v):
+    bad_a, bad_b = check(ra), check(rb)
+    if bad_a or bad_b:
+        logging.warning(f"topo3: rebuilding a mesh from its table, a dump does not match its counts: "
+                        f"{bad_a or bad_b}")
+    if not bad_a and not bad_b and _same_layout(a, b) and matches_view(a, v):
         out, ot = lww(ra, ats, rb, bts)
+        out = _flags_from_view(out, v)
         out[TOPO_KEY] = topo
         return out, ot
     if v["conflicts"]:

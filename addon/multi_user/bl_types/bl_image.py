@@ -15,6 +15,7 @@
 #
 # ##### END GPL LICENSE BLOCK #####
 
+import logging
 from pathlib import Path
 
 import bpy
@@ -116,7 +117,12 @@ class BlImage(ReplicatedDatablock):
             datablock.save()
 
         if datablock.filepath:
-            deps.append(Path(bpy.path.abspath(datablock.filepath)))
+            path = Path(bpy.path.abspath(datablock.filepath))
+            if path.is_file():
+                deps.append(path)
+            else:
+                # patched: an image whose file is missing still syncs, without its pixels
+                logging.warning(f"Image {datablock.name}: {path} not found, not sending the file")
 
         return deps
 

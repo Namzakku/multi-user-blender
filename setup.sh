@@ -30,7 +30,7 @@ fi
 ln -sf /opt/blender/blender /usr/local/bin/blender
 blender --version | head -1
 
-echo "== Multi-User 0.8.2+mu4 from addon/"
+echo "== Multi-User 0.8.2+mu5 from addon/"
 if [ -d "$EXT/blender_org/multi_user" ]; then
   echo "The upstream Multi-User is installed in $EXT/blender_org. Remove it first:" >&2
   echo "  rm -rf $EXT/blender_org/multi_user $SITE/replication*" >&2
@@ -44,7 +44,8 @@ test -f "$SITE/replication/topo3.py" || { echo "patched replication missing in $
 
 echo "== test scripts"
 mkdir -p "$UHOME/mu" "$UHOME/stress"
-cp "$HERE/patch/v3/gui_session.py" "$HERE/tests/live_session.py" "$HERE/tests/mesh_ops.py" "$HERE/tests/expected_meshes.py" "$UHOME/mu/"
+cp "$HERE/patch/v3/gui_session.py" "$HERE/tests/live_session.py" "$HERE/tests/live_mu5.py" "$HERE/tests/live_side.sh" \
+   "$HERE/tests/live_loop.sh" "$HERE/tests/live_check.py" "$HERE/tests/mesh_ops.py" "$HERE/tests/expected_meshes.py" "$HERE/tests/blender_units.py" "$UHOME/mu/"
 cp "$HERE/patch/v3/stress.py" "$HERE/patch/v3/run.sh" "$HERE/patch/v3/check.py" \
    "$HERE/patch/v3/check_topo.py" "$HERE/patch/v3/owners.py" "$UHOME/stress/"
 chown -R "$U:$U" "$UHOME/mu" "$UHOME/stress"
@@ -53,4 +54,4 @@ echo "== check"
 grep -q "'mu_vid'" "$MU/bl_types/bl_mesh.py"
 as_user blender -b --python-expr "import addon_utils; m = [x for x in addon_utils.modules() if x.__name__.endswith('multi_user')]; print('MU_CHECK', [(x.__name__, addon_utils.check(x.__name__)) for x in m])
 from replication import merge3, topo3; print('MU_CHECK merge3', merge3.ENABLED, 'topo3', topo3.ENABLED)" 2>&1 | grep MU_CHECK
-echo "Done. Multi-User 0.8.2+mu4 is installed for $U."
+echo "Done. Multi-User 0.8.2+mu5 is installed for $U."
